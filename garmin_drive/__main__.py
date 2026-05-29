@@ -249,15 +249,20 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
     should_render_outputs = args.no_upload or should_publish or bool(archives)
 
     generated_files = []
-    route_features = build_route_collection(settings, drive, publish_raw=publish_raw and not args.no_upload, archives=archives)
-    heatmap_state = build_heatmap_state_collection(
-        settings,
-        drive,
-        publish_raw=publish_raw and not args.no_upload,
-        archives=archives,
-        rebuild=False,
-    )
     if should_render_outputs:
+        # Only fetch the (potentially large) existing routes + heatmap state from
+        # Drive when we actually have something to render. On the common "nothing
+        # new" tick this is skipped entirely, avoiding megabytes of download/parse.
+        route_features = build_route_collection(
+            settings, drive, publish_raw=publish_raw and not args.no_upload, archives=archives
+        )
+        heatmap_state = build_heatmap_state_collection(
+            settings,
+            drive,
+            publish_raw=publish_raw and not args.no_upload,
+            archives=archives,
+            rebuild=False,
+        )
         generated_files = render_corpus(
             merged_runs,
             settings.output_dir,
@@ -272,10 +277,8 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
                 include_raw_state=publish_raw or args.no_upload,
             )
         )
-    raw_files: list[GeneratedFile] = []
-    if publish_raw and should_render_outputs:
-        raw_files = render_raw_outputs(settings, archives, route_features)
-        generated_files.extend(raw_files)
+        if publish_raw:
+            generated_files.extend(render_raw_outputs(settings, archives, route_features))
 
     if merged_runs != existing_runs:
         save_run_history(settings, merged_runs, backend=backend, drive=drive)
