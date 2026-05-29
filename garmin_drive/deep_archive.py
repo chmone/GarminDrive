@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -74,8 +75,8 @@ def archive_enrichment_fields(archive: dict[str, Any]) -> dict[str, Any]:
         "mile_splits": archive.get("mile_splits") or [],
         "mile_split_count": len(archive.get("mile_splits") or []),
         "route_available": route_available,
-        "raw_data_path": raw_run_relative_path(year, activity_id),
-        "route_geojson_path": route_relative_path(year, activity_id) if route_available else None,
+        "raw_data_path": raw_run_relative_path(year, activity, activity_id),
+        "route_geojson_path": route_relative_path(year, activity, activity_id) if route_available else None,
     }
 
 
@@ -275,12 +276,21 @@ def decode_polyline_value(polyline: str, index: int) -> tuple[int, int]:
     return delta, index
 
 
-def raw_run_relative_path(year: str, activity_id: str) -> str:
-    return f"{RAW_DATA_DIR}/{RAW_RUNS_DIR}/{year}/{activity_id}.json"
+def raw_file_stem(activity: dict[str, Any], activity_id: str | None = None) -> str:
+    activity_id = activity_id or str(activity.get("id") or "")
+    date = local_date(activity)
+    sport_type = str(activity.get("sport_type") or activity.get("type") or "activity")
+    name = str(activity.get("name") or sport_type)
+    slug = slugify_filename(f"{sport_type}-{name}")
+    return f"{date}_{slug}_{activity_id}"
 
 
-def route_relative_path(year: str, activity_id: str) -> str:
-    return f"{RAW_DATA_DIR}/{RAW_ROUTES_DIR}/{year}/{activity_id}.geojson"
+def raw_run_relative_path(year: str, activity: dict[str, Any], activity_id: str | None = None) -> str:
+    return f"{RAW_DATA_DIR}/{RAW_RUNS_DIR}/{year}/{raw_file_stem(activity, activity_id)}.json"
+
+
+def route_relative_path(year: str, activity: dict[str, Any], activity_id: str | None = None) -> str:
+    return f"{RAW_DATA_DIR}/{RAW_ROUTES_DIR}/{year}/{raw_file_stem(activity, activity_id)}.geojson"
 
 
 def local_cache_path(data_dir: Path, activity: dict[str, Any] | str, year: str | None = None) -> Path:
@@ -313,14 +323,15 @@ def write_raw_archive_files(output_dir: Path, archive: dict[str, Any]) -> list[P
     year = year_for_activity(activity)
     written: list[Path] = []
 
-    raw_path = output_dir / RAW_DATA_DIR / RAW_RUNS_DIR / year / f"{activity_id}.json"
+    stem = raw_file_stem(activity, activity_id)
+    raw_path = output_dir / RAW_DATA_DIR / RAW_RUNS_DIR / year / f"{stem}.json"
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     write_if_changed(raw_path, json.dumps(archive, indent=2, sort_keys=True) + "\n")
     written.append(raw_path)
 
     route = archive.get("route")
     if route:
-        route_path = output_dir / RAW_DATA_DIR / RAW_ROUTES_DIR / year / f"{activity_id}.geojson"
+        route_path = output_dir / RAW_DATA_DIR / RAW_ROUTES_DIR / year / f"{stem}.geojson"
         route_path.parent.mkdir(parents=True, exist_ok=True)
         write_if_changed(route_path, json.dumps(feature_collection([route]), indent=2, sort_keys=True) + "\n")
         written.append(route_path)
@@ -573,3 +584,8 @@ def html_escape(value: str) -> str:
         .replace('"', "&quot;")
         .replace("'", "&#39;")
     )
+
+
+def slugify_filename(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.lower()).strip("-")
+    return slug[:80] or "activity"

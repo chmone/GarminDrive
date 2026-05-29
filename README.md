@@ -24,8 +24,8 @@ Visible folder, intended for ChatGPT:
 - `Recent Run Map.html`
 - yearly Google Docs such as `Runs 2026`
 - `Raw Data/`
-  - `Runs/YYYY/{activity_id}.json`, with detailed activity data, all available streams, derived mile splits, and fetch metadata
-  - `Routes/YYYY/{activity_id}.geojson`, with exact route geometry when Strava provides GPS data
+  - `Runs/YYYY/{date}_{sport-and-name}_{activity_id}.json`, with detailed activity data, all available streams, derived mile splits, and fetch metadata
+  - `Routes/YYYY/{date}_{sport-and-name}_{activity_id}.geojson`, with exact route geometry when Strava provides GPS data
   - `All Run Routes.geojson`
   - `All Runs Map.html`
 
@@ -113,6 +113,14 @@ For a full backfill:
 
 The backfill is resumable. It caches raw archive files under `.data/raw_archive/`, stores sync metadata in hidden Drive app data, and skips raw files already listed in the hidden Drive manifest. If Strava's daily read limit is reached, rerun the same command after midnight UTC.
 
+To re-publish the cache without making Strava API calls, including rewriting raw archive output filenames with date/name/id labels:
+
+```powershell
+.\scripts\publish_cached_archive.ps1 -TrashOldIdFiles
+```
+
+`-TrashOldIdFiles` moves older ID-only raw files in the Drive `Raw Data` folders to trash after uploading the new named files. Local `.data/raw_archive/` stays intact.
+
 ## GitHub Actions Setup
 
 Push this repo to GitHub, then add these repository secrets:
@@ -161,6 +169,7 @@ python -m garmin_drive auth-google
 python -m garmin_drive bootstrap-appdata
 python -m garmin_drive sync-strava --state-backend drive --days 30 --enrich missing --publish-raw
 .\scripts\backfill_full_history.ps1 -Days 3650 -RequestBudget 900
+.\scripts\publish_cached_archive.ps1 -TrashOldIdFiles
 ```
 
 Use `--no-upload` to update local output and hidden state without publishing visible Drive files.

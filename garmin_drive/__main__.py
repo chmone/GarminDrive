@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -57,6 +58,30 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("auth-google", help="Authorize Google Drive and store the OAuth token locally.")
     subparsers.add_parser("bootstrap-appdata", help="Upload the local Strava token into hidden Google Drive app data.")
 
+    publish_cache_parser = subparsers.add_parser(
+        "publish-cache",
+        help="Rebuild and upload Drive outputs from the local raw archive cache without calling Strava.",
+    )
+    publish_cache_parser.add_argument("--force-upload", action="store_true", help="Rewrite visible Drive files.")
+    publish_cache_parser.add_argument("--recent-mile-days", type=int, default=14, help="Days of mile splits to expose in top-level files.")
+    publish_cache_parser.add_argument("--no-upload", action="store_true", help="Write local files but skip Drive uploads.")
+    publish_cache_parser.add_argument(
+        "--trash-id-only-raw",
+        action="store_true",
+        help="Move legacy ID-only raw files in Drive Raw Data folders to trash after uploading named files.",
+    )
+    publish_cache_parser.add_argument(
+        "--cleanup-local-id-only-raw",
+        action="store_true",
+        help="Delete legacy ID-only raw files from local run_summaries Raw Data folders.",
+    )
+    publish_cache_parser.add_argument(
+        "--state-backend",
+        choices=["auto", "local", "drive"],
+        default=None,
+        help="Where stored history and raw manifest live. Defaults to env/auto.",
+    )
+
     sync = subparsers.add_parser("sync-strava", help="Fetch included Strava activities and publish the Drive corpus.")
     sync.add_argument("--days", type=int, default=14, help="How many days of Strava history to inspect.")
     sync.add_argument("--max-pages", type=int, default=5, help="Maximum Strava pages to fetch, 200 activities each.")
@@ -101,6 +126,8 @@ def main(argv: list[str] | None = None) -> int:
         return auth_google(settings)
     if args.command == "bootstrap-appdata":
         return bootstrap_appdata(settings)
+    if args.command == "publish-cache":
+        return publish_cache(settings, args)
     if args.command == "sync-strava":
         return sync_strava(settings, args)
 
@@ -259,10 +286,152 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def publish_cache(settings: Settings, args: argparse.Namespace) -> int:
+    backend = resolve_state_backend(args.state_backend or settings.state_backend)
+    drive = drive_client(settings) if backend == "drive" or not args.no_upload else None
+    archives = load_cached_archives(settings)
+    if not archives:
+        raise RuntimeError(f"No cached raw archives found under {settings.data_dir / 'raw_archive'}.")
+
+    existing_history = load_run_history(settings, backend=backend, drive=drive)
+    cached_runs = []
+    for archive in archives:
+        activity = archive.get("activity") if isinstance(archive.get("activity"), dict) else None
+        if not activity or not is_run(activity):
+            continue
+        run = normalize_activity(activity)
+        run.update(archive_enrichment_fields(archive))
+        cached_runs.append(run)
+
+    merged_runs = merge_run_history(existing_history, cached_runs)
+    route_features = build_route_collection(settings, drive, publish_raw=not args.no_upload, archives=archives)
+    generated_files = render_corpus(
+        merged_runs,
+        settings.output_dir,
+        markdown_as_google_docs=settings.google_upload_as_google_docs,
+        recent_mile_days=args.recent_mile_days,
+        route_features=route_features,
+    )
+    generated_files.extend(render_raw_outputs(settings, archives, route_features))
+
+    removed_local = remove_legacy_id_only_local_raw_files(settings.output_dir) if args.cleanup_local_id_only_raw else 0
+    uploaded_count = 0
+    trashed_count = 0
+    raw_manifest = load_raw_manifest(settings, backend=backend, drive=drive)
+    if not args.no_upload:
+        if drive is None:
+            drive = drive_client(settings)
+        uploaded_count = upload_generated_files(
+            settings,
+            drive,
+            generated_files,
+            raw_manifest=raw_manifest,
+            force_upload=args.force_upload,
+        )
+        if args.trash_id_only_raw:
+            folder = drive.get_or_create_folder(settings.google_drive_folder_name, settings.google_drive_folder_id)
+            trashed_count = trash_legacy_id_only_raw_files(drive, folder["id"], raw_manifest)
+        save_raw_manifest(settings, raw_manifest, backend=backend, drive=drive)
+
+    save_run_history(settings, merged_runs, backend=backend, drive=drive)
+    sync_state = load_sync_state(settings, backend=backend, drive=drive)
+    sync_state.update(
+        {
+            "last_publish_cache_at": datetime.now(timezone.utc).isoformat(),
+            "last_publish_cache_archive_count": len(archives),
+            "last_publish_cache_included_activity_count": len(cached_runs),
+            "last_publish_cache_uploaded_count": uploaded_count,
+        }
+    )
+    save_sync_state(settings, sync_state, backend=backend, drive=drive)
+
+    print(f"Loaded {len(archives)} cached raw archives; {len(cached_runs)} match the configured activity types.")
+    print(f"Uploaded or updated {uploaded_count} Drive files.")
+    if trashed_count:
+        print(f"Moved {trashed_count} legacy ID-only raw Drive files to trash.")
+    if removed_local:
+        print(f"Removed {removed_local} legacy ID-only local raw output files.")
+    print(f"Local output: {settings.output_dir}")
+    return 0
+
+
 def drive_client(settings: Settings) -> DriveClient:
     from .drive import DriveClient
 
     return DriveClient(settings.google_client_secret_file, settings.google_token_file, settings.google_token_json)
+
+
+def load_cached_archives(settings: Settings) -> list[dict[str, Any]]:
+    cache_root = settings.data_dir / "raw_archive" / RAW_RUNS_DIR
+    if not cache_root.exists():
+        return []
+
+    archives: list[dict[str, Any]] = []
+    for path in sorted(cache_root.rglob("*.json")):
+        try:
+            archive = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            print(f"Skipped invalid cached archive: {path}")
+            continue
+        if isinstance(archive, dict) and isinstance(archive.get("activity"), dict):
+            archives.append(archive)
+    return archives
+
+
+def remove_legacy_id_only_local_raw_files(output_dir: Path) -> int:
+    removed = 0
+    roots = [
+        output_dir / RAW_DATA_DIR / RAW_RUNS_DIR,
+        output_dir / RAW_DATA_DIR / RAW_ROUTES_DIR,
+    ]
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if path.is_file() and is_legacy_id_only_raw_name(path.name):
+                path.unlink()
+                removed += 1
+    return removed
+
+
+def trash_legacy_id_only_raw_files(drive: DriveClient, root_folder_id: str, raw_manifest: dict[str, Any]) -> int:
+    trashed = 0
+    for folder_name in (RAW_RUNS_DIR, RAW_ROUTES_DIR):
+        parent = drive.find_folder_path(root_folder_id, (RAW_DATA_DIR, folder_name))
+        if not parent:
+            continue
+        year_folders = [
+            item
+            for item in drive.list_files_in_folder(parent["id"])
+            if item.get("mimeType") == "application/vnd.google-apps.folder"
+        ]
+        for year_folder in year_folders:
+            for item in drive.list_files_in_folder(year_folder["id"]):
+                name = str(item.get("name") or "")
+                if not is_legacy_id_only_raw_name(name):
+                    continue
+                activity_id = name.split(".", maxsplit=1)[0]
+                if not has_named_raw_replacement(raw_manifest, folder_name, str(year_folder.get("name") or ""), activity_id):
+                    continue
+                drive.trash_file(item["id"])
+                manifest_key = f"{RAW_DATA_DIR}/{folder_name}/{year_folder.get('name')}/{name}"
+                raw_manifest.get("files", {}).pop(manifest_key, None)
+                trashed += 1
+    return trashed
+
+
+def has_named_raw_replacement(raw_manifest: dict[str, Any], folder_name: str, year: str, activity_id: str) -> bool:
+    extension = "json" if folder_name == RAW_RUNS_DIR else "geojson"
+    prefix = f"{RAW_DATA_DIR}/{folder_name}/{year}/"
+    suffix = f"_{activity_id}.{extension}"
+    return any(
+        key.startswith(prefix) and key.endswith(suffix)
+        for key in raw_manifest.get("files", {})
+    )
+
+
+def is_legacy_id_only_raw_name(name: str) -> bool:
+    return re.fullmatch(r"\d+\.(json|geojson)", name) is not None
 
 
 def prepare_fetched_runs(
@@ -275,7 +444,7 @@ def prepare_fetched_runs(
     runs: list[dict[str, Any]] = []
     archives: list[dict[str, Any]] = []
 
-    for activity in activities:
+    for activity in sorted(activities, key=activity_sort_key, reverse=True):
         if not is_run(activity):
             continue
 
@@ -303,6 +472,13 @@ def prepare_fetched_runs(
         runs.append(run)
 
     return runs, archives, None
+
+
+def activity_sort_key(activity: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(activity.get("start_date_local") or activity.get("start_date") or ""),
+        str(activity.get("id") or ""),
+    )
 
 
 def should_enrich_run(enrich_mode: str, run: dict[str, Any]) -> bool:

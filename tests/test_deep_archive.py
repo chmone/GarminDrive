@@ -8,6 +8,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
+from garmin_drive.__main__ import activity_sort_key, has_named_raw_replacement
 from garmin_drive.corpus import render_corpus
 from garmin_drive.deep_archive import (
     MILE_METERS,
@@ -16,6 +17,8 @@ from garmin_drive.deep_archive import (
     derive_mile_splits,
     filter_routes_for_activity_ids,
     merge_route_features,
+    raw_run_relative_path,
+    route_relative_path,
 )
 from garmin_drive.render import is_run
 from garmin_drive.strava import StravaClient, StravaRequestBudgetExceeded, parse_limit_header
@@ -178,6 +181,46 @@ class DeepArchiveTests(unittest.TestCase):
             self.assertTrue(is_run({"sport_type": "Ride"}))
             self.assertTrue(is_run({"sport_type": "VirtualRide"}))
             self.assertFalse(is_run({"sport_type": "Swim"}))
+
+    def test_activity_sort_key_prioritizes_newest_for_enrichment(self) -> None:
+        activities = [
+            {"id": 1, "start_date_local": "2024-01-01T10:00:00Z"},
+            {"id": 2, "start_date_local": "2026-01-01T10:00:00Z"},
+            {"id": 3, "start_date_local": "2025-01-01T10:00:00Z"},
+        ]
+
+        sorted_ids = [activity["id"] for activity in sorted(activities, key=activity_sort_key, reverse=True)]
+
+        self.assertEqual(sorted_ids, [2, 3, 1])
+
+    def test_raw_paths_include_date_name_and_id(self) -> None:
+        activity = {
+            "id": 123,
+            "name": "Evening Run!",
+            "sport_type": "Run",
+            "start_date_local": "2026-05-27T18:00:00Z",
+        }
+
+        self.assertEqual(
+            raw_run_relative_path("2026", activity, "123"),
+            "Raw Data/Runs/2026/2026-05-27_run-evening-run_123.json",
+        )
+        self.assertEqual(
+            route_relative_path("2026", activity, "123"),
+            "Raw Data/Routes/2026/2026-05-27_run-evening-run_123.geojson",
+        )
+
+    def test_trash_guard_requires_named_replacement(self) -> None:
+        manifest = {
+            "files": {
+                "Raw Data/Runs/2026/2026-05-27_run-evening-run_123.json": {},
+                "Raw Data/Routes/2026/2026-05-27_run-evening-run_123.geojson": {},
+            }
+        }
+
+        self.assertTrue(has_named_raw_replacement(manifest, "Runs", "2026", "123"))
+        self.assertTrue(has_named_raw_replacement(manifest, "Routes", "2026", "123"))
+        self.assertFalse(has_named_raw_replacement(manifest, "Runs", "2026", "456"))
 
 
 if __name__ == "__main__":

@@ -109,6 +109,40 @@ class DriveClient:
             _, done = downloader.next_chunk()
         return buffer.getvalue().decode("utf-8")
 
+    def find_folder_path(self, root_folder_id: str, folder_parts: tuple[str, ...]) -> dict[str, Any] | None:
+        current = {"id": root_folder_id}
+        for folder_name in folder_parts:
+            current = self._find_first(
+                f"mimeType = '{FOLDER_MIME}' and name = '{escape_query(folder_name)}' "
+                f"and '{escape_query(current['id'])}' in parents and trashed = false"
+            )
+            if not current:
+                return None
+        return current
+
+    def list_files_in_folder(self, folder_id: str) -> list[dict[str, Any]]:
+        files: list[dict[str, Any]] = []
+        page_token = None
+        while True:
+            result = (
+                self.service.files()
+                .list(
+                    q=f"'{escape_query(folder_id)}' in parents and trashed = false",
+                    spaces="drive",
+                    fields="nextPageToken,files(id,name,mimeType)",
+                    pageSize=1000,
+                    pageToken=page_token,
+                )
+                .execute()
+            )
+            files.extend(result.get("files", []))
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                return files
+
+    def trash_file(self, file_id: str) -> dict[str, Any]:
+        return self.service.files().update(fileId=file_id, body={"trashed": True}, fields="id,name,trashed").execute()
+
     def upload_text_file(
         self,
         path: Path,
