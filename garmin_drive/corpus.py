@@ -27,6 +27,13 @@ from .render import (
 )
 
 
+PAST_SUMMARY_DIR = "Past Summary"
+DEFAULT_TOP_LEVEL_YEAR_COUNT = 2
+# Top-level files this app used to publish but no longer generates. They are
+# cleaned up locally and trashed on Drive so the ChatGPT folder stays lean.
+RETIRED_TOP_LEVEL_FILES = ("Run History Data.csv", "Recent Mile Splits.json")
+
+
 @dataclass(frozen=True)
 class GeneratedFile:
     path: Path
@@ -36,26 +43,6 @@ class GeneratedFile:
     changed: bool
     remote_folder_parts: tuple[str, ...] = ()
 
-
-CSV_FIELDS = [
-    "local_date",
-    "name",
-    "distance_miles",
-    "moving_time",
-    "pace_per_mile",
-    "elevation_gain_feet",
-    "average_heartrate",
-    "max_heartrate",
-    "calories",
-    "enriched",
-    "mile_split_count",
-    "route_available",
-    "raw_data_path",
-    "route_geojson_path",
-    "sport_type",
-    "source_activity_id",
-    "strava_activity_url",
-]
 
 MILE_SPLIT_CSV_FIELDS = [
     "local_date",
@@ -161,14 +148,30 @@ def run_history_payload(runs: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def past_summary_cutoff_year(
+    *,
+    top_level_year_count: int = DEFAULT_TOP_LEVEL_YEAR_COUNT,
+    current_year: int | None = None,
+) -> int:
+    """Years at or above this stay top-level; older years move to Past Summary."""
+    current = current_year if current_year is not None else date.today().year
+    return current - (max(1, top_level_year_count) - 1)
+
+
 def render_corpus(
     runs: list[dict[str, Any]],
     output_dir: Path,
     *,
     markdown_as_google_docs: bool,
     recent_mile_days: int = 14,
+    top_level_year_count: int = DEFAULT_TOP_LEVEL_YEAR_COUNT,
+    current_year: int | None = None,
 ) -> list[GeneratedFile]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    for retired_name in RETIRED_TOP_LEVEL_FILES:
+        retired_path = output_dir / retired_name
+        if retired_path.exists():
+            retired_path.unlink()
     generated: list[GeneratedFile] = []
     compact_runs = [compact_run_for_export(run) for run in runs]
     recent_split_rows = recent_mile_split_rows(runs, recent_days=recent_mile_days)
@@ -193,15 +196,6 @@ def render_corpus(
     )
     generated.append(
         write_generated(
-            output_dir / "Run History Data.csv",
-            render_csv(compact_runs),
-            remote_name="Run History Data.csv",
-            mime_type="text/csv",
-            as_google_doc=False,
-        )
-    )
-    generated.append(
-        write_generated(
             output_dir / "Recent Mile Splits.csv",
             render_mile_split_csv(recent_split_rows),
             remote_name="Recent Mile Splits.csv",
@@ -209,34 +203,28 @@ def render_corpus(
             as_google_doc=False,
         )
     )
-    generated.append(
-        write_generated(
-            output_dir / "Recent Mile Splits.json",
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "generated_at": datetime.now(timezone.utc).isoformat(),
-                    "recent_days": recent_mile_days,
-                    "split_count": len(recent_split_rows),
-                    "mile_splits": recent_split_rows,
-                },
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
-            remote_name="Recent Mile Splits.json",
-            mime_type="application/json",
-            as_google_doc=False,
-        )
+    cutoff_year = past_summary_cutoff_year(
+        top_level_year_count=top_level_year_count, current_year=current_year
     )
     for year, year_runs in group_by_year(runs).items():
+        if year >= cutoff_year:
+            year_path = output_dir / f"Runs {year}.md"
+            remote_parts: tuple[str, ...] = ()
+        else:
+            stale_top_level = output_dir / f"Runs {year}.md"
+            if stale_top_level.exists():
+                stale_top_level.unlink()
+            year_path = output_dir / PAST_SUMMARY_DIR / f"Runs {year}.md"
+            year_path.parent.mkdir(parents=True, exist_ok=True)
+            remote_parts = (PAST_SUMMARY_DIR,)
         generated.append(
             write_generated(
-                output_dir / f"Runs {year}.md",
+                year_path,
                 render_year(year, year_runs),
                 remote_name=f"Runs {year}",
                 mime_type="text/markdown",
                 as_google_doc=markdown_as_google_docs,
+                remote_folder_parts=remote_parts,
             )
         )
 
@@ -328,15 +316,6 @@ def render_year(year: int, runs: list[dict[str, Any]]) -> str:
 
     lines.append("")
     return "\n".join(lines)
-
-
-def render_csv(runs: list[dict[str, Any]]) -> str:
-    buffer = StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=CSV_FIELDS, extrasaction="ignore", lineterminator="\n")
-    writer.writeheader()
-    for run in runs:
-        writer.writerow(run)
-    return buffer.getvalue()
 
 
 def render_mile_split_csv(rows: list[dict[str, Any]]) -> str:

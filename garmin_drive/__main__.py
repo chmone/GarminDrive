@@ -13,7 +13,16 @@ from typing import TYPE_CHECKING, Any
 import requests
 
 from .config import Settings, ensure_local_dirs, get_settings
-from .corpus import GeneratedFile, merge_run_history, normalize_activity, render_corpus, run_history_payload, write_generated
+from .corpus import (
+    RETIRED_TOP_LEVEL_FILES,
+    GeneratedFile,
+    merge_run_history,
+    normalize_activity,
+    past_summary_cutoff_year,
+    render_corpus,
+    run_history_payload,
+    write_generated,
+)
 from .deep_archive import (
     ALL_ROUTES_NAME,
     RAW_DATA_DIR,
@@ -31,6 +40,7 @@ from .deep_archive import (
 from .heatmap import (
     ALL_TIME_ACTIVITY_MAP_NAME,
     HEATMAP_STATE_NAME,
+    MAPS_DIR,
     RAW_HEATMAP_DIR,
     RECENT_ACTIVITY_MAP_NAME,
     contributions_from_archives,
@@ -272,6 +282,7 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
 
     uploaded_count = 0
     trashed_map_count = 0
+    trashed_year_doc_count = 0
     if not args.no_upload:
         if generated_files and should_render_outputs:
             if drive is None:
@@ -284,8 +295,10 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
                 force_upload=args.force_upload,
             )
             print(f"Uploaded or updated {uploaded_count} visible Drive files.")
+            folder = drive.get_or_create_folder(settings.google_drive_folder_name, settings.google_drive_folder_id)
+            trashed_year_doc_count = trash_legacy_top_level_year_docs(drive, folder["id"], past_summary_cutoff_year())
+            trash_named_files_in_folder(drive, folder["id"], set(RETIRED_TOP_LEVEL_FILES))
             if generated_activity_maps(generated_files):
-                folder = drive.get_or_create_folder(settings.google_drive_folder_name, settings.google_drive_folder_id)
                 trashed_map_count = trash_legacy_map_html_files(drive, folder["id"])
             if publish_raw:
                 save_raw_manifest(settings, raw_manifest, backend=backend, drive=drive)
@@ -310,6 +323,8 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
 
     if trashed_map_count:
         print(f"Moved {trashed_map_count} legacy route-only map HTML files to trash.")
+    if trashed_year_doc_count:
+        print(f"Moved {trashed_year_doc_count} legacy top-level yearly docs to trash (now in Past Summary).")
     print(f"Stored history contains {len(merged_runs)} included activities.")
     print(f"Local output: {settings.output_dir}")
     return 0
@@ -361,6 +376,7 @@ def publish_cache(settings: Settings, args: argparse.Namespace) -> int:
     uploaded_count = 0
     trashed_count = 0
     trashed_map_count = 0
+    trashed_year_doc_count = 0
     raw_manifest = load_raw_manifest(settings, backend=backend, drive=drive)
     if not args.no_upload:
         if drive is None:
@@ -372,11 +388,12 @@ def publish_cache(settings: Settings, args: argparse.Namespace) -> int:
             raw_manifest=raw_manifest,
             force_upload=args.force_upload,
         )
+        folder = drive.get_or_create_folder(settings.google_drive_folder_name, settings.google_drive_folder_id)
+        trashed_year_doc_count = trash_legacy_top_level_year_docs(drive, folder["id"], past_summary_cutoff_year())
+        trash_named_files_in_folder(drive, folder["id"], set(RETIRED_TOP_LEVEL_FILES))
         if args.trash_id_only_raw:
-            folder = drive.get_or_create_folder(settings.google_drive_folder_name, settings.google_drive_folder_id)
             trashed_count = trash_legacy_id_only_raw_files(drive, folder["id"], raw_manifest)
         if generated_activity_maps(generated_files):
-            folder = drive.get_or_create_folder(settings.google_drive_folder_name, settings.google_drive_folder_id)
             trashed_map_count = trash_legacy_map_html_files(drive, folder["id"])
         save_raw_manifest(settings, raw_manifest, backend=backend, drive=drive)
 
@@ -398,6 +415,8 @@ def publish_cache(settings: Settings, args: argparse.Namespace) -> int:
         print(f"Moved {trashed_count} legacy ID-only raw Drive files to trash.")
     if trashed_map_count:
         print(f"Moved {trashed_map_count} legacy route-only map HTML files to trash.")
+    if trashed_year_doc_count:
+        print(f"Moved {trashed_year_doc_count} legacy top-level yearly docs to trash (now in Past Summary).")
     if removed_local:
         print(f"Removed {removed_local} legacy ID-only local raw output files.")
     print(f"Local output: {settings.output_dir}")
@@ -449,18 +468,27 @@ def trash_legacy_id_only_raw_files(drive: DriveClient, root_folder_id: str, raw_
         parent = drive.find_folder_path(root_folder_id, (RAW_DATA_DIR, folder_name))
         if not parent:
             continue
+        extension = "json" if folder_name == RAW_RUNS_DIR else "geojson"
         year_folders = [
             item
             for item in drive.list_files_in_folder(parent["id"])
             if item.get("mimeType") == "application/vnd.google-apps.folder"
         ]
         for year_folder in year_folders:
-            for item in drive.list_files_in_folder(year_folder["id"]):
+            items = drive.list_files_in_folder(year_folder["id"])
+            present_named_ids = named_raw_activity_ids(items, extension)
+            for item in items:
                 name = str(item.get("name") or "")
                 if not is_legacy_id_only_raw_name(name):
                     continue
                 activity_id = name.split(".", maxsplit=1)[0]
-                if not has_named_raw_replacement(raw_manifest, folder_name, str(year_folder.get("name") or ""), activity_id):
+                # Only trash an ID-only file once a date/name/id replacement exists.
+                # Trust the Drive folder listing first; fall back to the manifest so we
+                # still clean up even when the manifest missed earlier uploads.
+                has_replacement = activity_id in present_named_ids or has_named_raw_replacement(
+                    raw_manifest, folder_name, str(year_folder.get("name") or ""), activity_id
+                )
+                if not has_replacement:
                     continue
                 drive.trash_file(item["id"])
                 manifest_key = f"{RAW_DATA_DIR}/{folder_name}/{year_folder.get('name')}/{name}"
@@ -469,12 +497,46 @@ def trash_legacy_id_only_raw_files(drive: DriveClient, root_folder_id: str, raw_
     return trashed
 
 
+def named_raw_activity_ids(items: list[dict[str, Any]], extension: str) -> set[str]:
+    pattern = re.compile(rf"_(\d+)\.{extension}$")
+    ids: set[str] = set()
+    for item in items:
+        name = str(item.get("name") or "")
+        if is_legacy_id_only_raw_name(name):
+            continue
+        match = pattern.search(name)
+        if match:
+            ids.add(match.group(1))
+    return ids
+
+
 def trash_legacy_map_html_files(drive: DriveClient, root_folder_id: str) -> int:
     trashed = 0
-    trashed += trash_named_files_in_folder(drive, root_folder_id, {"Recent Run Map.html"})
+    # Old map names, plus the current map names that used to live at the top level
+    # before maps moved into the Maps/ subfolder.
+    trashed += trash_named_files_in_folder(
+        drive,
+        root_folder_id,
+        {"Recent Run Map.html", RECENT_ACTIVITY_MAP_NAME, ALL_TIME_ACTIVITY_MAP_NAME},
+    )
     raw_folder = drive.find_folder_path(root_folder_id, (RAW_DATA_DIR,))
     if raw_folder:
         trashed += trash_named_files_in_folder(drive, raw_folder["id"], {"All Runs Map.html"})
+    return trashed
+
+
+def trash_legacy_top_level_year_docs(drive: DriveClient, root_folder_id: str, cutoff_year: int) -> int:
+    """Trash top-level `Runs YYYY` docs for years that now live in Past Summary."""
+    trashed = 0
+    pattern = re.compile(r"^Runs (\d{4})(\.md)?$")
+    for item in drive.list_files_in_folder(root_folder_id):
+        if item.get("mimeType") == "application/vnd.google-apps.folder":
+            continue
+        match = pattern.match(str(item.get("name") or ""))
+        if not match or int(match.group(1)) >= cutoff_year:
+            continue
+        drive.trash_file(item["id"])
+        trashed += 1
     return trashed
 
 
@@ -676,20 +738,28 @@ def render_heatmap_outputs(
     recent_days: int,
     include_raw_state: bool,
 ) -> list[GeneratedFile]:
+    maps_dir = settings.output_dir / MAPS_DIR
+    maps_dir.mkdir(parents=True, exist_ok=True)
+    for stale_name in (RECENT_ACTIVITY_MAP_NAME, ALL_TIME_ACTIVITY_MAP_NAME):
+        stale_top_level = settings.output_dir / stale_name
+        if stale_top_level.exists():
+            stale_top_level.unlink()
     generated = [
         write_generated(
-            settings.output_dir / RECENT_ACTIVITY_MAP_NAME,
+            maps_dir / RECENT_ACTIVITY_MAP_NAME,
             render_activity_map_html("Recent Activity Map", heatmap_state, recent_days=recent_days),
             remote_name=RECENT_ACTIVITY_MAP_NAME,
             mime_type="text/html",
             as_google_doc=False,
+            remote_folder_parts=(MAPS_DIR,),
         ),
         write_generated(
-            settings.output_dir / ALL_TIME_ACTIVITY_MAP_NAME,
+            maps_dir / ALL_TIME_ACTIVITY_MAP_NAME,
             render_activity_map_html("All Time Activity Map", heatmap_state),
             remote_name=ALL_TIME_ACTIVITY_MAP_NAME,
             mime_type="text/html",
             as_google_doc=False,
+            remote_folder_parts=(MAPS_DIR,),
         ),
     ]
     state_dir = settings.output_dir / RAW_DATA_DIR / RAW_HEATMAP_DIR

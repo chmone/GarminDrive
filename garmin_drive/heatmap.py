@@ -8,6 +8,7 @@ from typing import Any
 from .render import is_run, local_date, meters_to_miles, number_or_none
 
 
+MAPS_DIR = "Maps"
 RECENT_ACTIVITY_MAP_NAME = "Recent Activity Map.html"
 ALL_TIME_ACTIVITY_MAP_NAME = "All Time Activity Map.html"
 RAW_HEATMAP_DIR = "Heatmaps"

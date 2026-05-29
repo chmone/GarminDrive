@@ -90,4 +90,3 @@ def ensure_local_dirs(settings: Settings) -> None:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.token_dir.mkdir(parents=True, exist_ok=True)
     settings.output_dir.mkdir(parents=True, exist_ok=True)
-    (settings.output_dir / "raw").mkdir(parents=True, exist_ok=True)
