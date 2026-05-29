@@ -12,9 +12,11 @@ from .corpus import GeneratedFile, write_generated
 
 
 RAW_HEALTH_DIR = "Raw Health"
-HEALTH_HISTORY_NAME = "Health History Data.json"
+HEALTH_HISTORY_JSON_NAME = "Health History Data.json"
+HEALTH_HISTORY_CSV_NAME = "Health History Data.csv"
 RECENT_RECOVERY_NAME = "Recent Recovery Metrics.csv"
 RECOVERY_SUMMARY_NAME = "Recovery Summary for ChatGPT"
+RETIRED_HEALTH_TOP_LEVEL_FILES = (HEALTH_HISTORY_JSON_NAME,)
 
 HEALTH_CSV_FIELDS = [
     "date",
@@ -180,15 +182,31 @@ def render_health_corpus(
     recent_days: int = 14,
 ) -> list[GeneratedFile]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    for retired_name in RETIRED_HEALTH_TOP_LEVEL_FILES:
+        retired_path = output_dir / retired_name
+        if retired_path.exists():
+            retired_path.unlink()
     generated: list[GeneratedFile] = []
     payload = health_history_payload(days)
+    raw_dir = output_dir / RAW_HEALTH_DIR
+    raw_dir.mkdir(parents=True, exist_ok=True)
     generated.append(
         write_generated(
-            output_dir / HEALTH_HISTORY_NAME,
+            output_dir / HEALTH_HISTORY_CSV_NAME,
+            render_health_history_csv(days),
+            remote_name=HEALTH_HISTORY_CSV_NAME,
+            mime_type="text/csv",
+            as_google_doc=False,
+        )
+    )
+    generated.append(
+        write_generated(
+            raw_dir / HEALTH_HISTORY_JSON_NAME,
             json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            remote_name=HEALTH_HISTORY_NAME,
+            remote_name=HEALTH_HISTORY_JSON_NAME,
             mime_type="application/json",
             as_google_doc=False,
+            remote_folder_parts=(RAW_HEALTH_DIR,),
         )
     )
     generated.append(
@@ -236,6 +254,18 @@ def render_recent_recovery_csv(days: list[dict[str, Any]], *, recent_days: int =
     return buffer.getvalue()
 
 
+def render_health_history_csv(days: list[dict[str, Any]]) -> str:
+    buffer = StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=HEALTH_CSV_FIELDS, extrasaction="ignore", lineterminator="\n")
+    writer.writeheader()
+    for day in sorted(days, key=lambda item: str(item.get("date") or ""), reverse=True):
+        row = dict(day)
+        row["available_metrics"] = ",".join(str(item) for item in row.get("available_metrics") or [])
+        row["metric_errors"] = ",".join(sorted((row.get("metric_errors") or {}).keys()))
+        writer.writerow(row)
+    return buffer.getvalue()
+
+
 def render_recovery_summary(days: list[dict[str, Any]], *, recent_days: int = 14) -> str:
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     recent = sorted(days, key=lambda item: str(item.get("date") or ""), reverse=True)[:recent_days]
@@ -244,7 +274,7 @@ def render_recovery_summary(days: list[dict[str, Any]], *, recent_days: int = 14
         "",
         f"Generated: {generated}",
         "",
-        "This folder is generated from Garmin Connect wellness data. Use `Health History Data.json` for stable daily metrics and `Raw Health/` for detailed per-day Garmin payloads.",
+        "This folder is generated from Garmin Connect wellness data. Use `Health History Data.csv` for stable daily metrics and `Raw Health/` for machine-readable JSON payloads.",
         "",
         "## Recent Averages",
         "",

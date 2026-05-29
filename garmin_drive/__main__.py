@@ -58,6 +58,7 @@ from .garmin_health import (
     save_garmin_token,
 )
 from .health_corpus import (
+    RETIRED_HEALTH_TOP_LEVEL_FILES,
     health_days_from_history,
     health_history_payload,
     health_raw_manifest_key,
@@ -513,7 +514,12 @@ def sync_garmin_health(settings: Settings, args: argparse.Namespace) -> int:
                 root_folder=get_health_drive_folder(settings, drive),
                 raw_manifest=raw_manifest,
                 force_upload=args.force_upload or args.force_refetch,
-                raw_skip_prefixes=("Raw Health/",),
+                raw_skip_prefixes=("Raw Health/19", "Raw Health/20", "Raw Health/21"),
+            )
+            trash_named_files_in_folder(
+                drive,
+                get_health_drive_folder(settings, drive)["id"],
+                set(RETIRED_HEALTH_TOP_LEVEL_FILES),
             )
             save_health_raw_manifest(settings, raw_manifest, backend=backend, drive=drive)
             sync_state["last_published_digest"] = current_digest

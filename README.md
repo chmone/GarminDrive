@@ -19,23 +19,26 @@ Visible folders, intended for ChatGPT:
 
 - `Projects/Run History`
   - `Run History Index` Google Doc
-  - `Run History Data.json`
+  - `Run History Data.csv`
+  - `Mile Splits Data.csv`
   - `Recent Mile Splits.csv`
   - current and previous yearly run Google Docs, such as `Runs 2026`
   - `Past Summary/` with older yearly Google Docs
   - `Maps/Recent Activity Map.html`
   - `Maps/All Time Activity Map.html`
+  - `Raw Data/Run History Data.json`
   - `Raw Data/Runs/YYYY/{date}_{sport-and-name}_{activity_id}.json`
   - `Raw Data/Routes/YYYY/{date}_{sport-and-name}_{activity_id}.geojson`
   - `Raw Data/All Run Routes.geojson`
   - `Raw Data/Heatmaps/All Time Activity Map Data.json`
 - `Projects/Health Data`
-  - `Health History Data.json`
+  - `Health History Data.csv`
   - `Recent Recovery Metrics.csv`
   - `Recovery Summary for ChatGPT` Google Doc
+  - `Raw Health/Health History Data.json`
   - `Raw Health/YYYY/YYYY-MM-DD.json`
 
-Local generated output mirrors the same structure under this repo's `Projects/` directory, which is ignored by git.
+Local generated output mirrors the same structure under this repo's `Projects/` directory, which is ignored by git. ChatGPT-facing data is exported as Google Docs, Markdown, and CSV; machine-readable JSON is preserved under raw folders so the app does not lose archive detail.
 
 Hidden Google Drive app data, intended only for this app:
 

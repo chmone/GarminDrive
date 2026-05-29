@@ -249,7 +249,9 @@ class GarminHealthTests(unittest.TestCase):
             generated = render_health_corpus([day], [raw], output_dir, markdown_as_google_docs=False)
             raw_path = raw_health_path(output_dir, "2026-05-29")
 
-            self.assertTrue((output_dir / "Health History Data.json").exists())
+            self.assertTrue((output_dir / "Health History Data.csv").exists())
+            self.assertTrue((output_dir / "Raw Health" / "Health History Data.json").exists())
+            self.assertFalse((output_dir / "Health History Data.json").exists())
             self.assertTrue((output_dir / "Recent Recovery Metrics.csv").exists())
             self.assertTrue((output_dir / "Recovery Summary for ChatGPT.md").exists())
             self.assertTrue(raw_path.exists())

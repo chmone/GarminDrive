@@ -9,7 +9,7 @@ from io import StringIO
 from pathlib import Path
 from typing import Any
 
-from .deep_archive import compact_run_for_export, recent_mile_split_rows
+from .deep_archive import RAW_DATA_DIR, compact_run_for_export, recent_mile_split_rows
 from .render import (
     format_duration,
     format_km,
@@ -31,7 +31,7 @@ PAST_SUMMARY_DIR = "Past Summary"
 DEFAULT_TOP_LEVEL_YEAR_COUNT = 2
 # Top-level files this app used to publish but no longer generates. They are
 # cleaned up locally and trashed on Drive so the ChatGPT folder stays lean.
-RETIRED_TOP_LEVEL_FILES = ("Run History Data.csv", "Recent Mile Splits.json")
+RETIRED_TOP_LEVEL_FILES = ("Run History Data.json", "Recent Mile Splits.json")
 
 
 @dataclass(frozen=True)
@@ -62,6 +62,49 @@ MILE_SPLIT_CSV_FIELDS = [
     "average_cadence",
     "average_grade",
     "route_available",
+    "strava_activity_url",
+]
+
+RUN_HISTORY_CSV_PREFERRED_FIELDS = [
+    "source",
+    "source_activity_id",
+    "local_date",
+    "name",
+    "sport_type",
+    "start_date",
+    "start_date_local",
+    "timezone",
+    "distance_miles",
+    "distance_kilometers",
+    "moving_time_seconds",
+    "moving_time",
+    "elapsed_time_seconds",
+    "elapsed_time",
+    "pace_seconds_per_mile",
+    "pace_per_mile",
+    "elevation_gain_feet",
+    "elevation_gain_meters",
+    "average_heartrate",
+    "max_heartrate",
+    "calories",
+    "average_cadence",
+    "average_speed_mps",
+    "max_speed_mps",
+    "suffer_score",
+    "perceived_exertion",
+    "visibility",
+    "private",
+    "commute",
+    "manual",
+    "trainer",
+    "enriched",
+    "enriched_at",
+    "stream_types",
+    "stream_sample_count",
+    "mile_split_count",
+    "route_available",
+    "raw_data_path",
+    "route_geojson_path",
     "strava_activity_url",
 ]
 
@@ -175,6 +218,8 @@ def render_corpus(
     generated: list[GeneratedFile] = []
     compact_runs = [compact_run_for_export(run) for run in runs]
     recent_split_rows = recent_mile_split_rows(runs, recent_days=recent_mile_days)
+    raw_dir = output_dir / RAW_DATA_DIR
+    raw_dir.mkdir(parents=True, exist_ok=True)
 
     generated.append(
         write_generated(
@@ -187,11 +232,21 @@ def render_corpus(
     )
     generated.append(
         write_generated(
-            output_dir / "Run History Data.json",
+            output_dir / "Run History Data.csv",
+            render_run_history_csv(compact_runs),
+            remote_name="Run History Data.csv",
+            mime_type="text/csv",
+            as_google_doc=False,
+        )
+    )
+    generated.append(
+        write_generated(
+            raw_dir / "Run History Data.json",
             json.dumps(run_history_payload(compact_runs), indent=2, sort_keys=True) + "\n",
             remote_name="Run History Data.json",
             mime_type="application/json",
             as_google_doc=False,
+            remote_folder_parts=(RAW_DATA_DIR,),
         )
     )
     generated.append(
@@ -199,6 +254,15 @@ def render_corpus(
             output_dir / "Recent Mile Splits.csv",
             render_mile_split_csv(recent_split_rows),
             remote_name="Recent Mile Splits.csv",
+            mime_type="text/csv",
+            as_google_doc=False,
+        )
+    )
+    generated.append(
+        write_generated(
+            output_dir / "Mile Splits Data.csv",
+            render_mile_split_csv(all_mile_split_rows(runs)),
+            remote_name="Mile Splits Data.csv",
             mime_type="text/csv",
             as_google_doc=False,
         )
@@ -243,7 +307,7 @@ def render_index(runs: list[dict[str, Any]]) -> str:
         "",
         f"Generated: {generated}",
         "",
-        "This folder is generated for ChatGPT analysis of running history. Use the yearly run documents for readable detail and `Run History Data.json` or `Run History Data.csv` for structured calculations.",
+        "This folder is generated for ChatGPT analysis of running history. Use the yearly run documents for readable detail, `Run History Data.csv` for full run-level calculations, and `Mile Splits Data.csv` for derived per-mile detail. Machine-readable JSON is preserved under `Raw Data/`.",
         "",
         "## All-Time Totals",
         "",
@@ -325,6 +389,50 @@ def render_mile_split_csv(rows: list[dict[str, Any]]) -> str:
     for row in rows:
         writer.writerow(row)
     return buffer.getvalue()
+
+
+def render_run_history_csv(runs: list[dict[str, Any]]) -> str:
+    buffer = StringIO()
+    fieldnames = csv_fieldnames(runs, RUN_HISTORY_CSV_PREFERRED_FIELDS)
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore", lineterminator="\n")
+    writer.writeheader()
+    for run in runs:
+        writer.writerow(csv_safe_row(run))
+    return buffer.getvalue()
+
+
+def all_mile_split_rows(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for run in runs:
+        for split in run.get("mile_splits") or []:
+            if not isinstance(split, dict):
+                continue
+            row = {
+                "local_date": run.get("local_date"),
+                "name": run.get("name"),
+                "source_activity_id": run.get("source_activity_id"),
+                "strava_activity_url": run.get("strava_activity_url"),
+            }
+            row.update(split)
+            rows.append(row)
+    return rows
+
+
+def csv_fieldnames(rows: list[dict[str, Any]], preferred: list[str]) -> list[str]:
+    keys = {key for row in rows for key in row.keys()}
+    ordered = [field for field in preferred if field in keys]
+    ordered.extend(sorted(keys - set(ordered)))
+    return ordered
+
+
+def csv_safe_row(row: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for key, value in row.items():
+        if isinstance(value, list | dict):
+            safe[key] = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        else:
+            safe[key] = value
+    return safe
 
 
 def write_generated(

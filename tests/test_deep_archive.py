@@ -167,17 +167,20 @@ class DeepArchiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             out = Path(temp_dir)
             render_corpus([run], out, markdown_as_google_docs=False)
-            main_payload = json.loads((out / "Run History Data.json").read_text(encoding="utf-8"))
+            main_payload = json.loads((out / "Raw Data" / "Run History Data.json").read_text(encoding="utf-8"))
+            run_csv = (out / "Run History Data.csv").read_text(encoding="utf-8")
             recent_csv = (out / "Recent Mile Splits.csv").read_text(encoding="utf-8")
-            # Redundant twins are no longer generated.
-            run_csv_exists = (out / "Run History Data.csv").exists()
+            all_splits_csv = (out / "Mile Splits Data.csv").read_text(encoding="utf-8")
+            top_level_json_exists = (out / "Run History Data.json").exists()
             recent_json_exists = (out / "Recent Mile Splits.json").exists()
             old_map_exists = (out / "Recent Run Map.html").exists()
 
         self.assertNotIn("mile_splits", main_payload["runs"][0])
         self.assertEqual(main_payload["runs"][0]["mile_split_count"], 1)
+        self.assertIn("Morning Run", run_csv)
         self.assertIn("10:00/mi", recent_csv)
-        self.assertFalse(run_csv_exists)
+        self.assertIn("10:00/mi", all_splits_csv)
+        self.assertFalse(top_level_json_exists)
         self.assertFalse(recent_json_exists)
         self.assertFalse(old_map_exists)
 
