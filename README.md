@@ -1,34 +1,41 @@
-# Garmin/Strava Activity History to Google Drive
+# GarminDrive v1.1
 
-This project syncs Strava activity history into a Google Drive folder that ChatGPT can use as a source.
+This project syncs Strava activity history and Garmin Connect health data into Google Drive folders that ChatGPT can use as project sources.
 
 Recommended flow:
 
-1. Garmin watch syncs to Garmin Connect.
-2. Garmin Connect syncs activities to Strava.
-3. GitHub Actions runs this repo every 10 minutes.
-4. The job reads Strava, updates hidden sync state in Google Drive, and publishes readable run history files into a visible Google Drive folder.
-5. ChatGPT's Google Drive connector syncs that folder.
+1. Garmin watch syncs activities and wellness data to Garmin Connect.
+2. Garmin Connect auto-uploads activities to Strava.
+3. Render polls Strava every 10 minutes.
+4. Render syncs Garmin wellness data every 2 hours.
+5. The app stores durable tokens and sync state in hidden Google Drive appData because Render disks are ephemeral.
+6. Visible Drive files are published under `Projects/Run History` and `Projects/Health Data`.
 
-Strava is the first source because it has a normal OAuth API. Direct Garmin ingestion can be added later, but Garmin's official Health API requires Garmin Developer Program approval and may require a license fee.
+Strava remains the source of truth for activities and runs. Garmin Connect is used for recovery and wellness data such as Body Battery, all-day heart rate, resting heart rate, stress, HRV, sleep, respiration, SpO2, and training readiness when your account/device exposes them.
 
-## What Gets Written To Drive
+## Drive Output
 
-Visible folder, intended for ChatGPT:
+Visible folders, intended for ChatGPT:
 
-- `Run History Index` Google Doc
-- `Run History Data.json`, the complete run-level dataset (distance, pace, HR, cadence, speed, effort, elapsed vs moving, trainer/manual flags)
-- `Recent Mile Splits.csv`, compact mile-by-mile pace/HR/elevation for the recent window
-- yearly Google Docs for the current and previous year, such as `Runs 2026` and `Runs 2025`
-- `Past Summary/` with older yearly Google Docs such as `Runs 2024`, keeping the top level focused on the current training block
-- `Maps/`
-  - `Recent Activity Map.html`
-  - `All Time Activity Map.html`
-- `Raw Data/`
-  - `Runs/YYYY/{date}_{sport-and-name}_{activity_id}.json`, with detailed activity data, all available streams, derived mile splits, and fetch metadata
-  - `Routes/YYYY/{date}_{sport-and-name}_{activity_id}.geojson`, with exact route geometry when Strava provides GPS data
-  - `All Run Routes.geojson`
-  - `Heatmaps/All Time Activity Map Data.json`, with reusable per-activity heatmap and route contributions
+- `Projects/Run History`
+  - `Run History Index` Google Doc
+  - `Run History Data.json`
+  - `Recent Mile Splits.csv`
+  - current and previous yearly run Google Docs, such as `Runs 2026`
+  - `Past Summary/` with older yearly Google Docs
+  - `Maps/Recent Activity Map.html`
+  - `Maps/All Time Activity Map.html`
+  - `Raw Data/Runs/YYYY/{date}_{sport-and-name}_{activity_id}.json`
+  - `Raw Data/Routes/YYYY/{date}_{sport-and-name}_{activity_id}.geojson`
+  - `Raw Data/All Run Routes.geojson`
+  - `Raw Data/Heatmaps/All Time Activity Map Data.json`
+- `Projects/Health Data`
+  - `Health History Data.json`
+  - `Recent Recovery Metrics.csv`
+  - `Recovery Summary for ChatGPT` Google Doc
+  - `Raw Health/YYYY/YYYY-MM-DD.json`
+
+Local generated output mirrors the same structure under this repo's `Projects/` directory, which is ignored by git.
 
 Hidden Google Drive app data, intended only for this app:
 
@@ -36,8 +43,10 @@ Hidden Google Drive app data, intended only for this app:
 - `sync_state.json`
 - `run_history.json`
 - `raw_manifest.json`
-
-The hidden app data is important because Strava refresh tokens can rotate. GitHub Actions runners start fresh every run, so the latest Strava token must live somewhere durable.
+- `garmin_token.json`
+- `garmin_health_sync_state.json`
+- `garmin_health_history.json`
+- `garmin_health_raw_manifest.json`
 
 ## One-Time Setup
 
@@ -58,9 +67,7 @@ STRAVA_SCOPE=activity:read_all
 STRAVA_ACTIVITY_SPORT_TYPES=Run,TrailRun,VirtualRun,Treadmill,TrackRun,Ride,VirtualRide,MountainBikeRide,GravelRide,EBikeRide,EMountainBikeRide
 ```
 
-Use `activity:read` if you only want public/followers-visible activities. Use `activity:read_all` if you want private activities included.
-
-`STRAVA_ACTIVITY_SPORT_TYPES` controls which Strava activities are included in the history. The default includes normal runs, trail/treadmill/virtual runs, and common bike ride types. Indoor bike rides may arrive as `VirtualRide` or as `Ride` with Strava's trainer flag, so both are included.
+Use `activity:read_all` if you want private activities included. `STRAVA_ACTIVITY_SPORT_TYPES` controls which Strava activity types are included in run history.
 
 ### 2. Create a Google OAuth desktop client
 
@@ -74,10 +81,25 @@ In Google Cloud:
 
 This app requests:
 
-- `drive.file`, to create and update the visible ChatGPT folder/files
+- `drive.file`, to create and update the visible ChatGPT folders/files
 - `drive.appdata`, to store hidden rotating tokens and sync state
 
-### 3. Install locally
+### 3. Configure Drive folders
+
+The v1.1 defaults create this visible structure:
+
+```dotenv
+GOOGLE_DRIVE_PROJECTS_FOLDER_NAME=Projects
+GOOGLE_DRIVE_RUN_FOLDER_NAME=Run History
+GOOGLE_DRIVE_HEALTH_FOLDER_NAME=Health Data
+GOOGLE_DRIVE_PROJECTS_FOLDER_ID=
+GOOGLE_DRIVE_RUN_FOLDER_ID=
+GOOGLE_DRIVE_HEALTH_FOLDER_ID=
+```
+
+Leave IDs blank unless you want to pin the app to existing folders. Legacy `GOOGLE_DRIVE_FOLDER_ID` / `GOOGLE_DRIVE_FOLDER_NAME` still work for older single-folder run-history installs when no new folder settings are provided.
+
+### 4. Install locally
 
 ```powershell
 py -m venv .venv
@@ -85,108 +107,95 @@ py -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 4. Authorize Strava and Google
+### 5. Authorize Strava, Google, and Garmin
 
 ```powershell
 python -m garmin_drive auth-strava
 python -m garmin_drive auth-google
+python -m garmin_drive auth-garmin
 ```
 
-### 5. Bootstrap hidden Drive state
+`auth-garmin` uses the unofficial `garminconnect` library and saves a local tokenstore at `.data/tokens/garmin_token.json`. If Garmin asks for MFA, enter the code when prompted. Do not commit `.data/`, Garmin credentials, or token files.
+
+### 6. Bootstrap hidden Drive state
 
 ```powershell
 python -m garmin_drive bootstrap-appdata
+python -m garmin_drive bootstrap-garmin-appdata
 ```
 
-This uploads your local Strava token into Google Drive's hidden `appDataFolder`. From this point on, GitHub Actions can keep the token fresh without your PC being on.
+This uploads Strava and Garmin tokens into Google Drive's hidden `appDataFolder`. Render can then refresh/reuse tokens without relying on your PC or persistent local disk.
 
-### 6. Test using the same backend as GitHub Actions
+### 7. Test using the same backend as Render
 
 ```powershell
 python -m garmin_drive sync-strava --state-backend drive --days 30 --enrich missing --publish-raw
+python -m garmin_drive sync-garmin-health --state-backend drive --days 14
 ```
 
-For a full backfill:
+For a Garmin health backfill:
 
 ```powershell
-.\scripts\backfill_full_history.ps1 -Days 3650 -RequestBudget 900
+python -m garmin_drive backfill-garmin-health --state-backend drive --start-date 2024-01-01 --end-date 2026-05-29
 ```
 
-The backfill is resumable. It caches raw archive files under `.data/raw_archive/`, stores sync metadata in hidden Drive app data, and skips raw files already listed in the hidden Drive manifest. If Strava's daily read limit is reached, rerun the same command after midnight UTC.
+Backfill skips days already listed in the hidden Garmin health raw manifest. Add `--force-refetch` to rebuild existing raw health days.
 
-To re-publish the cache without making Strava API calls, including rewriting raw archive output filenames with date/name/id labels:
+For a larger Garmin history pull, use the chunked script so each batch updates Drive appData before the next batch starts:
 
 ```powershell
-.\scripts\publish_cached_archive.ps1 -TrashOldIdFiles
+.\scripts\backfill_garmin_health.ps1 -StartDate 2024-01-01 -EndDate 2026-05-29 -ChunkDays 30 -PauseSeconds 10
 ```
 
-`-TrashOldIdFiles` moves older ID-only raw files in the Drive `Raw Data` folders to trash after uploading the new named files. A file is only trashed once a date/name/id replacement exists in that Drive folder (the publisher checks the live folder listing, not just the hidden manifest, so cleanup still works even if the manifest missed earlier uploads). Local `.data/raw_archive/` stays intact.
+## Render Setup
 
-Every publish and scheduled sync also reorganizes yearly docs: the current and previous year stay at the top level, older `Runs YYYY` docs move into a `Past Summary/` subfolder, and stale top-level copies of the relocated years are moved to trash.
+Connect this repo as a Render Blueprint using `render.yaml`.
 
-The publisher also rebuilds `Recent Activity Map.html` and `All Time Activity Map.html` from the cached GPS streams, writing them into the `Maps/` subfolder to keep them out of the coach's core data set. Those maps include activity-type filters, heatmap/route modes, and metric modes for frequency, speed, heart rate, steepness, and uphill/downhill bias. Older route-only map files and stale top-level map copies are moved to trash after the new map files upload successfully.
+The blueprint defines:
 
-## GitHub Actions Setup
+- `garmin-drive-sync`, every 10 minutes:
+  - `python -m garmin_drive sync-strava --days 14 --max-pages 5 --enrich missing --publish-raw --recent-mile-days 14 --request-budget 900`
+- `garmin-health-sync`, every 2 hours:
+  - `python -m garmin_drive sync-garmin-health --days 14 --state-backend drive`
 
-Push this repo to GitHub, then add these repository secrets:
+Set these Render secrets:
 
 | Secret | Required | Value |
 | --- | --- | --- |
-| `STRAVA_CLIENT_ID` | yes | Strava app client ID |
-| `STRAVA_CLIENT_SECRET` | yes | Strava app client secret |
-| `GOOGLE_TOKEN_JSON` | yes | Contents of `.data/tokens/google_token.json` |
-| `GOOGLE_DRIVE_FOLDER_ID` | no | Existing output folder ID, only if the app can access it |
-| `STRAVA_TOKEN_JSON_BOOTSTRAP` | no | Contents of `.data/tokens/strava_token.json`, only if you skip `bootstrap-appdata` |
+| `STRAVA_CLIENT_ID` | yes, Strava cron | Strava app client ID |
+| `STRAVA_CLIENT_SECRET` | yes, Strava cron | Strava app client secret |
+| `GOOGLE_TOKEN_JSON` | yes, both crons | Contents of `.data/tokens/google_token.json` |
 
-The included workflow lives at `.github/workflows/sync-runs.yml` and runs every 10 minutes:
-
-```yaml
-schedule:
-  - cron: "3,13,23,33,43,53 * * * *"
-```
-
-The offset minutes avoid the top of the hour, when scheduled GitHub Actions jobs are more likely to be delayed. A "nothing new" run costs a single Strava read call and skips all Drive uploads, so frequent polling is cheap. GitHub's scheduler is best-effort, so expect occasional skipped ticks. This frequency is comfortable on Strava's read limits for a single athlete and free on GitHub Actions for a public repository.
-
-You can also run it manually from GitHub's Actions tab. For the first manual run, use:
-
-- `days`: `3650`
-- `max_pages`: `25`
-- `force_upload`: `true`
-- `request_budget`: `900`
-
-After that, the scheduled default of 14 days is enough to catch new runs and recent edits.
-
-## ChatGPT Setup
-
-Connect Google Drive in ChatGPT settings and choose the sync option. Ask ChatGPT to use the generated Drive folder.
-
-Example prompt:
-
-```text
-Use my Google Drive run history folder. Summarize my last 8 weeks of running, identify mileage trend, long-run progression, average pace changes, and any signs I am stacking too much intensity.
-```
+Garmin credentials are not required on Render after `bootstrap-garmin-appdata` succeeds. The Garmin cron reads `garmin_token.json` from Drive appData and writes refreshed tokens back there.
 
 ## Local Commands
 
 ```powershell
 python -m garmin_drive auth-strava
 python -m garmin_drive auth-google
+python -m garmin_drive auth-garmin
 python -m garmin_drive bootstrap-appdata
+python -m garmin_drive bootstrap-garmin-appdata
 python -m garmin_drive sync-strava --state-backend drive --days 30 --enrich missing --publish-raw
+python -m garmin_drive sync-garmin-health --state-backend drive --days 14
+python -m garmin_drive backfill-garmin-health --state-backend drive --start-date 2024-01-01 --end-date 2026-05-29
+python -m garmin_drive sync-all --state-backend drive --days 14 --health-days 14
 .\scripts\backfill_full_history.ps1 -Days 3650 -RequestBudget 900
+.\scripts\backfill_garmin_health.ps1 -StartDate 2024-01-01 -EndDate 2026-05-29 -ChunkDays 30
 .\scripts\publish_cached_archive.ps1 -TrashOldIdFiles
 ```
 
-Use `--no-upload` to update local output and hidden state without publishing visible Drive files.
+Use `--no-upload` to update local output and hidden state without publishing visible Drive files. Use `--force-upload` to rebuild visible Drive files. Use `--force-refetch` with Garmin range backfills when you want to overwrite raw health days that were already archived.
 
-Use `--dry-run` to inspect fetched runs without writing.
+## ChatGPT Setup
 
-Use `--force-upload` if you need to rebuild the visible Drive folder even when the hidden run-history digest says nothing changed.
+Connect Google Drive in ChatGPT settings, then connect both project source folders:
 
-Use `--enrich none`, `--enrich missing`, or `--enrich full` to control detailed Strava activity/stream fetching. `missing` is the default and is what scheduled GitHub Actions uses.
+- `Projects/Run History`
+- `Projects/Health Data`
 
-Use `--recent-mile-days 14` to control how much mile-by-mile HR/elevation detail appears in top-level compact files. Full sample streams remain in `Raw Data`.
+Example prompt:
 
-Use `--request-budget 900` to cap Strava API calls during a run. The app watches Strava rate-limit headers and sleeps through short 15-minute read limits when useful.
-
-To include different activity types, edit `STRAVA_ACTIVITY_SPORT_TYPES` in `.env` and the matching GitHub Actions environment value. Strava sport types are case-sensitive, for example `Run`, `TrailRun`, `Ride`, and `VirtualRide`.
+```text
+Use my Run History and Health Data folders together. Summarize my last 8 weeks of training, compare activity load against sleep, resting HR, HRV, stress, and Body Battery trends, and call out recovery risks.
+```

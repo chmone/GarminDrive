@@ -43,11 +43,12 @@ jobs:
       STRAVA_ACTIVITY_SPORT_TYPES: Run,TrailRun,VirtualRun,Treadmill,TrackRun,Ride,VirtualRide,MountainBikeRide,GravelRide,EBikeRide,EMountainBikeRide
       STRAVA_TOKEN_JSON_BOOTSTRAP: ${{ secrets.STRAVA_TOKEN_JSON_BOOTSTRAP }}
       GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
-      GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
-      GOOGLE_DRIVE_FOLDER_NAME: Run History for ChatGPT
+      GOOGLE_DRIVE_PROJECTS_FOLDER_NAME: Projects
+      GOOGLE_DRIVE_RUN_FOLDER_NAME: Run History
+      GOOGLE_DRIVE_HEALTH_FOLDER_NAME: Health Data
       GOOGLE_UPLOAD_AS_GOOGLE_DOCS: "true"
       GARMIN_DRIVE_STATE_BACKEND: drive
-      GARMIN_DRIVE_OUTPUT_DIR: run_summaries
+      GARMIN_DRIVE_OUTPUT_DIR: Projects/Run History
 
     steps:
       - name: Check out repository

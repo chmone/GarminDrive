@@ -37,16 +37,27 @@ def required_env(name: str) -> str:
 class Settings:
     data_dir: Path
     output_dir: Path
+    health_output_dir: Path
     strava_client_id: str | None
     strava_client_secret: str | None
     strava_scope: str
     strava_token_json_bootstrap: str | None
     google_client_secret_file: Path
     google_token_json: str | None
+    google_drive_projects_folder_name: str
+    google_drive_projects_folder_id: str | None
+    google_drive_run_folder_name: str
+    google_drive_run_folder_id: str | None
+    google_drive_health_folder_name: str
+    google_drive_health_folder_id: str | None
     google_drive_folder_name: str
     google_drive_folder_id: str | None
+    use_legacy_drive_folder: bool
     google_upload_as_google_docs: bool
     state_backend: str
+    garmin_email: str | None
+    garmin_password: str | None
+    garmin_health_timezone: str
 
     @property
     def token_dir(self) -> Path:
@@ -64,25 +75,54 @@ class Settings:
     def google_token_file(self) -> Path:
         return self.token_dir / "google_token.json"
 
+    @property
+    def garmin_token_file(self) -> Path:
+        return self.token_dir / "garmin_token.json"
+
 
 def get_settings() -> Settings:
     google_client_secret = Path(os.getenv("GOOGLE_CLIENT_SECRET_FILE", "client_secret_google.json")).expanduser()
     if not google_client_secret.is_absolute():
         google_client_secret = PROJECT_ROOT / google_client_secret
+    new_drive_folder_env_present = any(
+        os.getenv(name)
+        for name in (
+            "GOOGLE_DRIVE_PROJECTS_FOLDER_NAME",
+            "GOOGLE_DRIVE_PROJECTS_FOLDER_ID",
+            "GOOGLE_DRIVE_RUN_FOLDER_NAME",
+            "GOOGLE_DRIVE_RUN_FOLDER_ID",
+            "GOOGLE_DRIVE_HEALTH_FOLDER_NAME",
+            "GOOGLE_DRIVE_HEALTH_FOLDER_ID",
+        )
+    )
+    legacy_drive_folder_name = os.getenv("GOOGLE_DRIVE_FOLDER_NAME")
+    legacy_drive_folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID") or None
+    use_legacy_drive_folder = bool((legacy_drive_folder_name or legacy_drive_folder_id) and not new_drive_folder_env_present)
 
     return Settings(
         data_dir=_path_from_env("GARMIN_DRIVE_DATA_DIR", ".data"),
-        output_dir=_path_from_env("GARMIN_DRIVE_OUTPUT_DIR", "run_summaries"),
+        output_dir=_path_from_env("GARMIN_DRIVE_OUTPUT_DIR", "Projects/Run History"),
+        health_output_dir=_path_from_env("GARMIN_DRIVE_HEALTH_OUTPUT_DIR", "Projects/Health Data"),
         strava_client_id=os.getenv("STRAVA_CLIENT_ID"),
         strava_client_secret=os.getenv("STRAVA_CLIENT_SECRET"),
         strava_scope=os.getenv("STRAVA_SCOPE", "activity:read_all"),
         strava_token_json_bootstrap=os.getenv("STRAVA_TOKEN_JSON_BOOTSTRAP") or None,
         google_client_secret_file=google_client_secret,
         google_token_json=os.getenv("GOOGLE_TOKEN_JSON") or None,
-        google_drive_folder_name=os.getenv("GOOGLE_DRIVE_FOLDER_NAME", "Run History for ChatGPT"),
-        google_drive_folder_id=os.getenv("GOOGLE_DRIVE_FOLDER_ID") or None,
+        google_drive_projects_folder_name=os.getenv("GOOGLE_DRIVE_PROJECTS_FOLDER_NAME", "Projects"),
+        google_drive_projects_folder_id=os.getenv("GOOGLE_DRIVE_PROJECTS_FOLDER_ID") or None,
+        google_drive_run_folder_name=os.getenv("GOOGLE_DRIVE_RUN_FOLDER_NAME", "Run History"),
+        google_drive_run_folder_id=os.getenv("GOOGLE_DRIVE_RUN_FOLDER_ID") or None,
+        google_drive_health_folder_name=os.getenv("GOOGLE_DRIVE_HEALTH_FOLDER_NAME", "Health Data"),
+        google_drive_health_folder_id=os.getenv("GOOGLE_DRIVE_HEALTH_FOLDER_ID") or None,
+        google_drive_folder_name=legacy_drive_folder_name or "Run History",
+        google_drive_folder_id=legacy_drive_folder_id,
+        use_legacy_drive_folder=use_legacy_drive_folder,
         google_upload_as_google_docs=env_bool("GOOGLE_UPLOAD_AS_GOOGLE_DOCS", True),
         state_backend=os.getenv("GARMIN_DRIVE_STATE_BACKEND", "auto"),
+        garmin_email=os.getenv("GARMIN_EMAIL") or None,
+        garmin_password=os.getenv("GARMIN_PASSWORD") or None,
+        garmin_health_timezone=os.getenv("GARMIN_HEALTH_TIMEZONE", "America/New_York"),
     )
 
 
@@ -90,3 +130,4 @@ def ensure_local_dirs(settings: Settings) -> None:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.token_dir.mkdir(parents=True, exist_ok=True)
     settings.output_dir.mkdir(parents=True, exist_ok=True)
+    settings.health_output_dir.mkdir(parents=True, exist_ok=True)

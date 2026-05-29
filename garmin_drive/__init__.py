@@ -1,3 +1,3 @@
-"""Sync run summaries from Strava into Google Drive."""
+"""Sync Strava activities and Garmin Connect health data into Google Drive."""
 
-__version__ = "0.1.0"
+__version__ = "1.1.0"

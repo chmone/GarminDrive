@@ -6,9 +6,10 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -49,6 +50,21 @@ from .heatmap import (
     merge_heatmap_state,
     render_activity_map_html,
 )
+from .garmin_health import (
+    auth_garmin as authorize_garmin,
+    fetch_daily_health_archive,
+    load_garmin_client,
+    read_token_text as read_garmin_token_text,
+    save_garmin_token,
+)
+from .health_corpus import (
+    health_days_from_history,
+    health_history_payload,
+    health_raw_manifest_key,
+    merge_health_history,
+    normalize_health_archive,
+    render_health_corpus,
+)
 from .render import is_run
 from .state import load_state, save_state
 from .strava import (
@@ -66,15 +82,26 @@ APPDATA_STRAVA_TOKEN = "strava_token.json"
 APPDATA_SYNC_STATE = "sync_state.json"
 APPDATA_RUN_HISTORY = "run_history.json"
 APPDATA_RAW_MANIFEST = "raw_manifest.json"
+APPDATA_GARMIN_TOKEN = "garmin_token.json"
+APPDATA_GARMIN_HEALTH_SYNC_STATE = "garmin_health_sync_state.json"
+APPDATA_GARMIN_HEALTH_HISTORY = "garmin_health_history.json"
+APPDATA_GARMIN_HEALTH_RAW_MANIFEST = "garmin_health_raw_manifest.json"
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Sync Strava run history into Google Drive for ChatGPT.")
+    parser = argparse.ArgumentParser(
+        description="Sync Strava activity history and Garmin Connect health data into Google Drive for ChatGPT."
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("auth-strava", help="Authorize Strava and store the OAuth token locally.")
     subparsers.add_parser("auth-google", help="Authorize Google Drive and store the OAuth token locally.")
+    subparsers.add_parser("auth-garmin", help="Authorize Garmin Connect and store the tokenstore locally.")
     subparsers.add_parser("bootstrap-appdata", help="Upload the local Strava token into hidden Google Drive app data.")
+    subparsers.add_parser(
+        "bootstrap-garmin-appdata",
+        help="Upload the local Garmin tokenstore into hidden Google Drive app data.",
+    )
 
     publish_cache_parser = subparsers.add_parser(
         "publish-cache",
@@ -91,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     publish_cache_parser.add_argument(
         "--cleanup-local-id-only-raw",
         action="store_true",
-        help="Delete legacy ID-only raw files from local run_summaries Raw Data folders.",
+        help="Delete legacy ID-only raw files from local output Raw Data folders.",
     )
     publish_cache_parser.add_argument(
         "--state-backend",
@@ -134,6 +161,52 @@ def main(argv: list[str] | None = None) -> int:
         help="Where rotating Strava tokens and run history live. Defaults to env/auto.",
     )
 
+    health_sync = subparsers.add_parser(
+        "sync-garmin-health",
+        help="Fetch Garmin Connect health data and publish the health corpus.",
+    )
+    add_health_sync_args(health_sync)
+
+    health_backfill = subparsers.add_parser(
+        "backfill-garmin-health",
+        help="Fetch a date range of Garmin Connect health data.",
+    )
+    add_health_sync_args(health_backfill)
+
+    sync_all = subparsers.add_parser("sync-all", help="Run Strava activity sync and Garmin health sync.")
+    sync_all.add_argument("--days", type=int, default=14, help="How many days of Strava history to inspect.")
+    sync_all.add_argument("--health-days", type=int, default=14, help="How many recent Garmin health days to fetch.")
+    sync_all.add_argument("--max-pages", type=int, default=5, help="Maximum Strava pages to fetch, 200 activities each.")
+    sync_all.add_argument("--no-upload", action="store_true", help="Write local files and state but skip visible Drive uploads.")
+    sync_all.add_argument("--force-upload", action="store_true", help="Rewrite visible Drive files.")
+    sync_all.add_argument(
+        "--enrich",
+        choices=["none", "missing", "full"],
+        default="missing",
+        help="Fetch detailed Strava activity and stream data.",
+    )
+    sync_all.add_argument(
+        "--publish-raw",
+        dest="publish_raw",
+        action="store_true",
+        default=None,
+        help="Publish detailed raw Strava archive files.",
+    )
+    sync_all.add_argument(
+        "--no-publish-raw",
+        dest="publish_raw",
+        action="store_false",
+        help="Skip visible Strava raw archive publishing.",
+    )
+    sync_all.add_argument("--recent-mile-days", type=int, default=14, help="Days of mile splits to expose.")
+    sync_all.add_argument("--request-budget", type=int, default=900, help="Maximum Strava API requests to spend.")
+    sync_all.add_argument(
+        "--state-backend",
+        choices=["auto", "local", "drive"],
+        default=None,
+        help="Where tokens and sync state live. Defaults to env/auto.",
+    )
+
     args = parser.parse_args(argv)
     settings = get_settings()
     ensure_local_dirs(settings)
@@ -142,15 +215,40 @@ def main(argv: list[str] | None = None) -> int:
         return auth_strava(settings)
     if args.command == "auth-google":
         return auth_google(settings)
+    if args.command == "auth-garmin":
+        return auth_garmin(settings)
     if args.command == "bootstrap-appdata":
         return bootstrap_appdata(settings)
+    if args.command == "bootstrap-garmin-appdata":
+        return bootstrap_garmin_appdata(settings)
     if args.command == "publish-cache":
         return publish_cache(settings, args)
     if args.command == "sync-strava":
         return sync_strava(settings, args)
+    if args.command == "sync-garmin-health":
+        return sync_garmin_health(settings, args)
+    if args.command == "backfill-garmin-health":
+        return backfill_garmin_health(settings, args)
+    if args.command == "sync-all":
+        return sync_all_sources(settings, args)
 
     parser.error(f"Unknown command: {args.command}")
     return 2
+
+
+def add_health_sync_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--days", type=int, default=14, help="How many recent Garmin health days to fetch.")
+    parser.add_argument("--start-date", help="First Garmin health date to fetch, YYYY-MM-DD.")
+    parser.add_argument("--end-date", help="Last Garmin health date to fetch, YYYY-MM-DD. Defaults to today for ranges.")
+    parser.add_argument("--force-refetch", action="store_true", help="Refetch range dates even if raw archives exist.")
+    parser.add_argument("--no-upload", action="store_true", help="Write local files and state but skip visible Drive uploads.")
+    parser.add_argument("--force-upload", action="store_true", help="Rewrite visible Drive files.")
+    parser.add_argument(
+        "--state-backend",
+        choices=["auto", "local", "drive"],
+        default=None,
+        help="Where Garmin health tokens and state live. Defaults to env/auto.",
+    )
 
 
 def auth_strava(settings: Settings) -> int:
@@ -194,7 +292,28 @@ def bootstrap_appdata(settings: Settings) -> int:
     if existing_manifest is None:
         drive.put_appdata_json(APPDATA_RAW_MANIFEST, {"schema_version": 1, "files": {}})
     print(f"Uploaded {APPDATA_STRAVA_TOKEN} to hidden Google Drive app data.")
-    print("GitHub Actions can now refresh and persist Strava tokens without using your PC.")
+    print("Render can now refresh and persist Strava tokens without using your PC.")
+    return 0
+
+
+def auth_garmin(settings: Settings) -> int:
+    authorize_garmin(settings)
+    print(f"Saved Garmin tokenstore to {settings.garmin_token_file}")
+    return 0
+
+
+def bootstrap_garmin_appdata(settings: Settings) -> int:
+    token_text = read_garmin_token_text(settings.garmin_token_file)
+    drive = drive_client(settings)
+    drive.put_appdata_text(APPDATA_GARMIN_TOKEN, token_text, mime_type="application/json")
+    if drive.get_appdata_json(APPDATA_GARMIN_HEALTH_HISTORY) is None:
+        drive.put_appdata_json(APPDATA_GARMIN_HEALTH_HISTORY, health_history_payload([]))
+    if drive.get_appdata_json(APPDATA_GARMIN_HEALTH_SYNC_STATE) is None:
+        drive.put_appdata_json(APPDATA_GARMIN_HEALTH_SYNC_STATE, {})
+    if drive.get_appdata_json(APPDATA_GARMIN_HEALTH_RAW_MANIFEST) is None:
+        drive.put_appdata_json(APPDATA_GARMIN_HEALTH_RAW_MANIFEST, {"schema_version": 1, "files": {}})
+    print(f"Uploaded {APPDATA_GARMIN_TOKEN} to hidden Google Drive app data.")
+    print("Render can now reuse Garmin Connect tokens without local disk persistence.")
     return 0
 
 
@@ -294,11 +413,12 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
                 settings,
                 drive,
                 generated_files,
+                root_folder=get_run_drive_folder(settings, drive),
                 raw_manifest=raw_manifest,
                 force_upload=args.force_upload,
             )
             print(f"Uploaded or updated {uploaded_count} visible Drive files.")
-            folder = drive.get_or_create_folder(settings.google_drive_folder_name, settings.google_drive_folder_id)
+            folder = get_run_drive_folder(settings, drive)
             trashed_year_doc_count = trash_legacy_top_level_year_docs(drive, folder["id"], past_summary_cutoff_year())
             trash_named_files_in_folder(drive, folder["id"], set(RETIRED_TOP_LEVEL_FILES))
             if generated_activity_maps(generated_files):
@@ -331,6 +451,133 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
     print(f"Stored history contains {len(merged_runs)} included activities.")
     print(f"Local output: {settings.output_dir}")
     return 0
+
+
+def sync_garmin_health(settings: Settings, args: argparse.Namespace) -> int:
+    backend = resolve_state_backend(args.state_backend or settings.state_backend)
+    drive = drive_client(settings) if backend == "drive" or not args.no_upload else None
+    date_strings, range_mode = health_sync_dates(settings, args)
+    raw_manifest = load_health_raw_manifest(settings, backend=backend, drive=drive)
+    existing_history = load_health_history(settings, backend=backend, drive=drive)
+    existing_days = health_days_from_history(existing_history)
+
+    dates_to_fetch = []
+    skipped_dates = []
+    for cdate in date_strings:
+        manifest_key = health_raw_manifest_key(cdate)
+        if range_mode and not args.force_refetch and manifest_key in raw_manifest.get("files", {}):
+            skipped_dates.append(cdate)
+            continue
+        dates_to_fetch.append(cdate)
+
+    raw_archives: list[dict[str, Any]] = []
+    if dates_to_fetch:
+        api = load_garmin_client(settings, backend=backend, drive=drive)
+        for cdate in dates_to_fetch:
+            raw_archives.append(fetch_daily_health_archive(api, cdate))
+        save_garmin_token(settings, backend=backend, drive=drive)
+
+    fetched_days = [normalize_health_archive(archive) for archive in raw_archives]
+    merged_days = merge_health_history(existing_history, fetched_days)
+    current_digest = health_history_digest(merged_days)
+    sync_state = load_health_sync_state(settings, backend=backend, drive=drive)
+    should_publish = (
+        args.force_upload
+        or args.force_refetch
+        or sync_state.get("last_published_digest") != current_digest
+        or bool(raw_archives)
+    )
+
+    generated_files = []
+    if args.no_upload or should_publish:
+        generated_files = render_health_corpus(
+            merged_days,
+            raw_archives,
+            settings.health_output_dir,
+            markdown_as_google_docs=settings.google_upload_as_google_docs,
+            recent_days=args.days,
+        )
+
+    if fetched_days or merged_days != existing_days:
+        save_health_history(settings, merged_days, backend=backend, drive=drive)
+
+    uploaded_count = 0
+    if not args.no_upload:
+        if generated_files and should_publish:
+            if drive is None:
+                drive = drive_client(settings)
+            uploaded_count = upload_generated_files(
+                settings,
+                drive,
+                generated_files,
+                root_folder=get_health_drive_folder(settings, drive),
+                raw_manifest=raw_manifest,
+                force_upload=args.force_upload or args.force_refetch,
+                raw_skip_prefixes=("Raw Health/",),
+            )
+            save_health_raw_manifest(settings, raw_manifest, backend=backend, drive=drive)
+            sync_state["last_published_digest"] = current_digest
+            sync_state["last_published_at"] = datetime.now(timezone.utc).isoformat()
+        else:
+            print("Health history is unchanged; skipped visible Drive uploads.")
+
+    sync_state.update(
+        {
+            "last_sync_at": datetime.now(timezone.utc).isoformat(),
+            "state_backend": backend,
+            "last_health_requested_dates": len(date_strings),
+            "last_health_fetched_dates": len(raw_archives),
+            "last_health_skipped_dates": len(skipped_dates),
+            "stored_health_day_count": len(merged_days),
+            "current_history_digest": current_digest,
+        }
+    )
+    save_health_sync_state(settings, sync_state, backend=backend, drive=drive)
+
+    print(f"Fetched Garmin health data for {len(raw_archives)} days; skipped {len(skipped_dates)} archived days.")
+    if not args.no_upload:
+        print(f"Uploaded or updated {uploaded_count} health Drive files.")
+    print(f"Stored health history contains {len(merged_days)} days.")
+    print(f"Local health output: {settings.health_output_dir}")
+    return 0
+
+
+def backfill_garmin_health(settings: Settings, args: argparse.Namespace) -> int:
+    if not args.start_date:
+        raise RuntimeError("backfill-garmin-health requires --start-date YYYY-MM-DD.")
+    if not args.end_date:
+        args.end_date = health_today(settings).isoformat()
+    return sync_garmin_health(settings, args)
+
+
+def sync_all_sources(settings: Settings, args: argparse.Namespace) -> int:
+    strava_args = argparse.Namespace(
+        days=args.days,
+        max_pages=args.max_pages,
+        no_upload=args.no_upload,
+        dry_run=False,
+        force_upload=args.force_upload,
+        enrich=args.enrich,
+        publish_raw=args.publish_raw,
+        recent_mile_days=args.recent_mile_days,
+        request_budget=args.request_budget,
+        state_backend=args.state_backend,
+    )
+    strava_result = sync_strava(settings, strava_args)
+    health_args = argparse.Namespace(
+        days=args.health_days,
+        start_date=None,
+        end_date=None,
+        force_refetch=False,
+        no_upload=args.no_upload,
+        force_upload=args.force_upload,
+        state_backend=args.state_backend,
+    )
+    try:
+        sync_garmin_health(settings, health_args)
+    except Exception as exc:
+        print(f"Garmin health sync failed without interrupting Strava sync: {exc}", file=sys.stderr)
+    return strava_result
 
 
 def publish_cache(settings: Settings, args: argparse.Namespace) -> int:
@@ -388,10 +635,11 @@ def publish_cache(settings: Settings, args: argparse.Namespace) -> int:
             settings,
             drive,
             generated_files,
+            root_folder=get_run_drive_folder(settings, drive),
             raw_manifest=raw_manifest,
             force_upload=args.force_upload,
         )
-        folder = drive.get_or_create_folder(settings.google_drive_folder_name, settings.google_drive_folder_id)
+        folder = get_run_drive_folder(settings, drive)
         trashed_year_doc_count = trash_legacy_top_level_year_docs(drive, folder["id"], past_summary_cutoff_year())
         trash_named_files_in_folder(drive, folder["id"], set(RETIRED_TOP_LEVEL_FILES))
         if args.trash_id_only_raw:
@@ -430,6 +678,28 @@ def drive_client(settings: Settings) -> DriveClient:
     from .drive import DriveClient
 
     return DriveClient(settings.google_client_secret_file, settings.google_token_file, settings.google_token_json)
+
+
+def get_run_drive_folder(settings: Settings, drive: DriveClient) -> dict[str, Any]:
+    if settings.use_legacy_drive_folder:
+        return drive.get_or_create_folder(settings.google_drive_folder_name, settings.google_drive_folder_id)
+    projects = drive.get_or_create_folder(
+        settings.google_drive_projects_folder_name,
+        settings.google_drive_projects_folder_id,
+    )
+    if settings.google_drive_run_folder_id:
+        return drive.get_or_create_folder(settings.google_drive_run_folder_name, settings.google_drive_run_folder_id)
+    return drive.get_or_create_child_folder(projects["id"], settings.google_drive_run_folder_name)
+
+
+def get_health_drive_folder(settings: Settings, drive: DriveClient) -> dict[str, Any]:
+    projects = drive.get_or_create_folder(
+        settings.google_drive_projects_folder_name,
+        settings.google_drive_projects_folder_id,
+    )
+    if settings.google_drive_health_folder_id:
+        return drive.get_or_create_folder(settings.google_drive_health_folder_name, settings.google_drive_health_folder_id)
+    return drive.get_or_create_child_folder(projects["id"], settings.google_drive_health_folder_name)
 
 
 def load_cached_archives(settings: Settings) -> list[dict[str, Any]]:
@@ -692,7 +962,7 @@ def build_route_collection(
 ) -> dict[str, Any]:
     existing_routes = None
     if publish_raw and drive is not None:
-        folder = drive.get_or_create_folder(settings.google_drive_folder_name, settings.google_drive_folder_id)
+        folder = get_run_drive_folder(settings, drive)
         existing_routes = load_geojson_text(
             drive.get_text_file_by_path(folder["id"], (RAW_DATA_DIR,), ALL_ROUTES_NAME)
         )
@@ -722,7 +992,7 @@ def build_heatmap_state_collection(
 
     existing_state = None
     if publish_raw and drive is not None:
-        folder = drive.get_or_create_folder(settings.google_drive_folder_name, settings.google_drive_folder_id)
+        folder = get_run_drive_folder(settings, drive)
         existing_state = load_heatmap_state_text(
             drive.get_text_file_by_path(folder["id"], (RAW_DATA_DIR, RAW_HEATMAP_DIR), HEATMAP_STATE_NAME)
         )
@@ -972,9 +1242,142 @@ def save_raw_manifest(
     drive.put_appdata_json(APPDATA_RAW_MANIFEST, manifest)
 
 
+def load_health_history(settings: Settings, *, backend: str, drive: DriveClient | None) -> Any:
+    if backend == "local":
+        state = load_state(settings.state_file)
+        return state.get("garmin_health_history", {"days": []})
+    if drive is None:
+        raise RuntimeError("Drive state backend requires Google Drive credentials.")
+    return drive.get_appdata_json(APPDATA_GARMIN_HEALTH_HISTORY) or {"days": []}
+
+
+def save_health_history(
+    settings: Settings,
+    days: list[dict[str, Any]],
+    *,
+    backend: str,
+    drive: DriveClient | None,
+) -> None:
+    payload = health_history_payload(days)
+    if backend == "local":
+        state = load_state(settings.state_file)
+        state["garmin_health_history"] = payload["days"]
+        save_state(settings.state_file, state)
+        return
+    if drive is None:
+        raise RuntimeError("Drive state backend requires Google Drive credentials.")
+    drive.put_appdata_json(APPDATA_GARMIN_HEALTH_HISTORY, payload)
+
+
+def load_health_sync_state(settings: Settings, *, backend: str, drive: DriveClient | None) -> dict[str, Any]:
+    if backend == "local":
+        state = load_state(settings.state_file)
+        health_state = state.get("garmin_health_sync_state")
+        return health_state if isinstance(health_state, dict) else {}
+    if drive is None:
+        raise RuntimeError("Drive state backend requires Google Drive credentials.")
+    state = drive.get_appdata_json(APPDATA_GARMIN_HEALTH_SYNC_STATE) or {}
+    return state if isinstance(state, dict) else {}
+
+
+def save_health_sync_state(
+    settings: Settings,
+    update: dict[str, Any],
+    *,
+    backend: str,
+    drive: DriveClient | None,
+) -> None:
+    if backend == "local":
+        state = load_state(settings.state_file)
+        health_state = state.get("garmin_health_sync_state")
+        if not isinstance(health_state, dict):
+            health_state = {}
+        health_state.update(update)
+        state["garmin_health_sync_state"] = health_state
+        save_state(settings.state_file, state)
+        return
+    if drive is None:
+        raise RuntimeError("Drive state backend requires Google Drive credentials.")
+    state = drive.get_appdata_json(APPDATA_GARMIN_HEALTH_SYNC_STATE) or {}
+    state.update(update)
+    drive.put_appdata_json(APPDATA_GARMIN_HEALTH_SYNC_STATE, state)
+
+
+def load_health_raw_manifest(settings: Settings, *, backend: str, drive: DriveClient | None) -> dict[str, Any]:
+    if backend == "local":
+        state = load_state(settings.state_file)
+        manifest = state.get("garmin_health_raw_manifest")
+    else:
+        if drive is None:
+            raise RuntimeError("Drive state backend requires Google Drive credentials.")
+        manifest = drive.get_appdata_json(APPDATA_GARMIN_HEALTH_RAW_MANIFEST)
+    if not isinstance(manifest, dict):
+        return {"schema_version": 1, "files": {}}
+    manifest.setdefault("schema_version", 1)
+    manifest.setdefault("files", {})
+    return manifest
+
+
+def save_health_raw_manifest(
+    settings: Settings,
+    manifest: dict[str, Any],
+    *,
+    backend: str,
+    drive: DriveClient | None,
+) -> None:
+    manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if backend == "local":
+        state = load_state(settings.state_file)
+        state["garmin_health_raw_manifest"] = manifest
+        save_state(settings.state_file, state)
+        return
+    if drive is None:
+        raise RuntimeError("Drive state backend requires Google Drive credentials.")
+    drive.put_appdata_json(APPDATA_GARMIN_HEALTH_RAW_MANIFEST, manifest)
+
+
 def run_history_digest(runs: list[dict[str, Any]]) -> str:
     content = json.dumps(runs, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def health_history_digest(days: list[dict[str, Any]]) -> str:
+    content = json.dumps(days, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def health_sync_dates(settings: Settings, args: argparse.Namespace) -> tuple[list[str], bool]:
+    if args.start_date:
+        start = parse_date_arg(args.start_date, "start-date")
+        end = parse_date_arg(args.end_date, "end-date") if args.end_date else health_today(settings)
+        if end < start:
+            raise RuntimeError("--end-date must be on or after --start-date.")
+        return date_range(start, end), True
+    if args.end_date:
+        raise RuntimeError("--end-date requires --start-date.")
+
+    days = max(1, int(args.days))
+    end = health_today(settings)
+    start = end - timedelta(days=days - 1)
+    return date_range(start, end), False
+
+
+def parse_date_arg(value: str, label: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid --{label}: {value}. Expected YYYY-MM-DD.") from exc
+
+
+def date_range(start: date, end: date) -> list[str]:
+    return [(start + timedelta(days=offset)).isoformat() for offset in range((end - start).days + 1)]
+
+
+def health_today(settings: Settings) -> date:
+    try:
+        return datetime.now(ZoneInfo(settings.garmin_health_timezone)).date()
+    except Exception:
+        return date.today()
 
 
 def upload_generated_files(
@@ -982,10 +1385,12 @@ def upload_generated_files(
     drive: DriveClient,
     generated_files: list[GeneratedFile],
     *,
+    root_folder: dict[str, Any] | None = None,
     raw_manifest: dict[str, Any] | None = None,
     force_upload: bool = False,
+    raw_skip_prefixes: tuple[str, ...] | None = None,
 ) -> int:
-    folder = drive.get_or_create_folder(settings.google_drive_folder_name, settings.google_drive_folder_id)
+    folder = root_folder or get_run_drive_folder(settings, drive)
     folder_id = folder["id"]
     folder_cache: dict[tuple[str, ...], str] = {(): folder_id}
 
@@ -993,7 +1398,7 @@ def upload_generated_files(
     for generated in generated_files:
         remote_parts = generated.remote_folder_parts
         manifest_key = "/".join((*remote_parts, generated.remote_name))
-        if should_skip_raw_upload(manifest_key, raw_manifest, force_upload):
+        if should_skip_raw_upload(manifest_key, raw_manifest, force_upload, raw_skip_prefixes):
             continue
         target_folder_id = folder_cache.get(remote_parts)
         if target_folder_id is None:
@@ -1018,9 +1423,18 @@ def upload_generated_files(
     return count
 
 
-def should_skip_raw_upload(manifest_key: str, raw_manifest: dict[str, Any] | None, force_upload: bool) -> bool:
+def should_skip_raw_upload(
+    manifest_key: str,
+    raw_manifest: dict[str, Any] | None,
+    force_upload: bool,
+    raw_skip_prefixes: tuple[str, ...] | None = None,
+) -> bool:
     if force_upload or raw_manifest is None:
         return False
+    if raw_skip_prefixes is not None:
+        return any(manifest_key.startswith(prefix) for prefix in raw_skip_prefixes) and manifest_key in raw_manifest.get(
+            "files", {}
+        )
     if manifest_key == f"{RAW_DATA_DIR}/{ALL_ROUTES_NAME}":
         return False
     if not (

@@ -5,9 +5,11 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
-# Local OAuth tokens, sync state, and generated run exports.
+# Local OAuth tokens, sync state, and generated exports.
 .data/
+Projects/
 run_summaries/
+health_summaries/
 
 # OAuth client secret downloads from Google Cloud.
 client_secret*.json
