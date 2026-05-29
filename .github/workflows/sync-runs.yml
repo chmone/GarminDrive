@@ -2,7 +2,7 @@ name: Sync Activity History
 
 on:
   schedule:
-    - cron: "17 */4 * * *"
+    - cron: "3,13,23,33,43,53 * * * *"
   workflow_dispatch:
     inputs:
       days:

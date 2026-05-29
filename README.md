@@ -6,7 +6,7 @@ Recommended flow:
 
 1. Garmin watch syncs to Garmin Connect.
 2. Garmin Connect syncs activities to Strava.
-3. GitHub Actions runs this repo every 4 hours.
+3. GitHub Actions runs this repo every 10 minutes.
 4. The job reads Strava, updates hidden sync state in Google Drive, and publishes readable run history files into a visible Google Drive folder.
 5. ChatGPT's Google Drive connector syncs that folder.
 
@@ -138,14 +138,14 @@ Push this repo to GitHub, then add these repository secrets:
 | `GOOGLE_DRIVE_FOLDER_ID` | no | Existing output folder ID, only if the app can access it |
 | `STRAVA_TOKEN_JSON_BOOTSTRAP` | no | Contents of `.data/tokens/strava_token.json`, only if you skip `bootstrap-appdata` |
 
-The included workflow lives at `.github/workflows/sync-runs.yml` and runs every 4 hours:
+The included workflow lives at `.github/workflows/sync-runs.yml` and runs every 10 minutes:
 
 ```yaml
 schedule:
-  - cron: "17 */4 * * *"
+  - cron: "3,13,23,33,43,53 * * * *"
 ```
 
-The `17` minute avoids the top of the hour, when scheduled GitHub Actions jobs are more likely to be delayed.
+The offset minutes avoid the top of the hour, when scheduled GitHub Actions jobs are more likely to be delayed. A "nothing new" run costs a single Strava read call and skips all Drive uploads, so frequent polling is cheap. GitHub's scheduler is best-effort, so expect occasional skipped ticks. This frequency is comfortable on Strava's read limits for a single athlete and free on GitHub Actions for a public repository.
 
 You can also run it manually from GitHub's Actions tab. For the first manual run, use:
 
