@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -8,13 +9,26 @@ from pathlib import Path
 from typing import Any
 
 
-RUN_SPORT_TYPES = {
+DEFAULT_ACTIVITY_SPORT_TYPES = {
     "Run",
     "TrailRun",
     "VirtualRun",
     "Treadmill",
     "TrackRun",
+    "Ride",
+    "VirtualRide",
+    "MountainBikeRide",
+    "GravelRide",
+    "EBikeRide",
+    "EMountainBikeRide",
 }
+
+
+def included_activity_sport_types() -> set[str]:
+    configured = os.getenv("STRAVA_ACTIVITY_SPORT_TYPES")
+    if not configured:
+        return DEFAULT_ACTIVITY_SPORT_TYPES
+    return {item.strip() for item in configured.split(",") if item.strip()}
 
 
 @dataclass(frozen=True)
@@ -34,7 +48,7 @@ class RenderedActivity:
 
 def is_run(activity: dict[str, Any]) -> bool:
     sport_type = activity.get("sport_type") or activity.get("type")
-    return sport_type in RUN_SPORT_TYPES
+    return sport_type in included_activity_sport_types()
 
 
 def render_activity(activity: dict[str, Any], output_dir: Path) -> RenderedActivity:

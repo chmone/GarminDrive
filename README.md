@@ -19,13 +19,22 @@ Visible folder, intended for ChatGPT:
 - `Run History Index` Google Doc
 - `Run History Data.json`
 - `Run History Data.csv`
+- `Recent Mile Splits.json`
+- `Recent Mile Splits.csv`
+- `Recent Run Map.html`
 - yearly Google Docs such as `Runs 2026`
+- `Raw Data/`
+  - `Runs/YYYY/{activity_id}.json`, with detailed activity data, all available streams, derived mile splits, and fetch metadata
+  - `Routes/YYYY/{activity_id}.geojson`, with exact route geometry when Strava provides GPS data
+  - `All Run Routes.geojson`
+  - `All Runs Map.html`
 
 Hidden Google Drive app data, intended only for this app:
 
 - `strava_token.json`
 - `sync_state.json`
 - `run_history.json`
+- `raw_manifest.json`
 
 The hidden app data is important because Strava refresh tokens can rotate. GitHub Actions runners start fresh every run, so the latest Strava token must live somewhere durable.
 
@@ -45,9 +54,12 @@ Copy `.env.example` to `.env`, then set:
 STRAVA_CLIENT_ID=12345
 STRAVA_CLIENT_SECRET=your-secret
 STRAVA_SCOPE=activity:read_all
+STRAVA_ACTIVITY_SPORT_TYPES=Run,TrailRun,VirtualRun,Treadmill,TrackRun,Ride,VirtualRide,MountainBikeRide,GravelRide,EBikeRide,EMountainBikeRide
 ```
 
-Use `activity:read` if you only want public/followers-visible activities. Use `activity:read_all` if you want private runs included.
+Use `activity:read` if you only want public/followers-visible activities. Use `activity:read_all` if you want private activities included.
+
+`STRAVA_ACTIVITY_SPORT_TYPES` controls which Strava activities are included in the history. The default includes normal runs, trail/treadmill/virtual runs, and common bike ride types. Indoor bike rides may arrive as `VirtualRide` or as `Ride` with Strava's trainer flag, so both are included.
 
 ### 2. Create a Google OAuth desktop client
 
@@ -90,14 +102,16 @@ This uploads your local Strava token into Google Drive's hidden `appDataFolder`.
 ### 6. Test using the same backend as GitHub Actions
 
 ```powershell
-python -m garmin_drive sync-strava --state-backend drive --days 30
+python -m garmin_drive sync-strava --state-backend drive --days 30 --enrich missing --publish-raw
 ```
 
 For a full backfill:
 
 ```powershell
-python -m garmin_drive sync-strava --state-backend drive --days 3650 --max-pages 25
+.\scripts\backfill_full_history.ps1 -Days 3650 -RequestBudget 900
 ```
+
+The backfill is resumable. It caches raw archive files under `.data/raw_archive/`, stores sync metadata in hidden Drive app data, and skips raw files already listed in the hidden Drive manifest. If Strava's daily read limit is reached, rerun the same command after midnight UTC.
 
 ## GitHub Actions Setup
 
@@ -125,6 +139,7 @@ You can also run it manually from GitHub's Actions tab. For the first manual run
 - `days`: `3650`
 - `max_pages`: `25`
 - `force_upload`: `true`
+- `request_budget`: `900`
 
 After that, the scheduled default of 14 days is enough to catch new runs and recent edits.
 
@@ -144,7 +159,8 @@ Use my Google Drive run history folder. Summarize my last 8 weeks of running, id
 python -m garmin_drive auth-strava
 python -m garmin_drive auth-google
 python -m garmin_drive bootstrap-appdata
-python -m garmin_drive sync-strava --state-backend drive --days 30
+python -m garmin_drive sync-strava --state-backend drive --days 30 --enrich missing --publish-raw
+.\scripts\backfill_full_history.ps1 -Days 3650 -RequestBudget 900
 ```
 
 Use `--no-upload` to update local output and hidden state without publishing visible Drive files.
@@ -152,3 +168,11 @@ Use `--no-upload` to update local output and hidden state without publishing vis
 Use `--dry-run` to inspect fetched runs without writing.
 
 Use `--force-upload` if you need to rebuild the visible Drive folder even when the hidden run-history digest says nothing changed.
+
+Use `--enrich none`, `--enrich missing`, or `--enrich full` to control detailed Strava activity/stream fetching. `missing` is the default and is what scheduled GitHub Actions uses.
+
+Use `--recent-mile-days 14` to control how much mile-by-mile HR/elevation detail appears in top-level compact files. Full sample streams remain in `Raw Data`.
+
+Use `--request-budget 900` to cap Strava API calls during a run. The app watches Strava rate-limit headers and sleeps through short 15-minute read limits when useful.
+
+To include different activity types, edit `STRAVA_ACTIVITY_SPORT_TYPES` in `.env` and the matching GitHub Actions environment value. Strava sport types are case-sensitive, for example `Run`, `TrailRun`, `Ride`, and `VirtualRide`.

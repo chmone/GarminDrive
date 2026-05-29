@@ -68,6 +68,47 @@ class DriveClient:
         metadata = {"name": folder_name, "mimeType": FOLDER_MIME}
         return self.service.files().create(body=metadata, fields="id,name,webViewLink").execute()
 
+    def get_or_create_child_folder(self, parent_id: str, folder_name: str) -> dict[str, Any]:
+        existing = self._find_first(
+            f"mimeType = '{FOLDER_MIME}' and name = '{escape_query(folder_name)}' "
+            f"and '{escape_query(parent_id)}' in parents and trashed = false"
+        )
+        if existing:
+            return existing
+
+        metadata = {"name": folder_name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
+        return self.service.files().create(body=metadata, fields="id,name,webViewLink").execute()
+
+    def get_or_create_folder_path(self, root_folder_id: str, folder_parts: tuple[str, ...]) -> dict[str, Any]:
+        current = {"id": root_folder_id}
+        for folder_name in folder_parts:
+            current = self.get_or_create_child_folder(current["id"], folder_name)
+        return current
+
+    def get_text_file_by_path(self, root_folder_id: str, folder_parts: tuple[str, ...], name: str) -> str | None:
+        current_id = root_folder_id
+        for folder_name in folder_parts:
+            folder = self._find_first(
+                f"mimeType = '{FOLDER_MIME}' and name = '{escape_query(folder_name)}' "
+                f"and '{escape_query(current_id)}' in parents and trashed = false"
+            )
+            if not folder:
+                return None
+            current_id = folder["id"]
+
+        existing = self._find_first(
+            f"name = '{escape_query(name)}' and '{escape_query(current_id)}' in parents and trashed = false"
+        )
+        if not existing:
+            return None
+        request = self.service.files().get_media(fileId=existing["id"])
+        buffer = io.BytesIO()
+        downloader = MediaIoBaseDownload(buffer, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        return buffer.getvalue().decode("utf-8")
+
     def upload_text_file(
         self,
         path: Path,

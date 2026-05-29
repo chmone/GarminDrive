@@ -6,12 +6,38 @@ import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import requests
+
 from .config import Settings, ensure_local_dirs, get_settings
-from .corpus import merge_run_history, normalize_runs, render_corpus, run_history_payload
+from .corpus import GeneratedFile, merge_run_history, normalize_activity, render_corpus, run_history_payload, write_generated
+from .deep_archive import (
+    ALL_MAP_NAME,
+    ALL_ROUTES_NAME,
+    RAW_DATA_DIR,
+    RAW_ROUTES_DIR,
+    RAW_RUNS_DIR,
+    archive_enrichment_fields,
+    build_raw_archive,
+    feature_collection,
+    load_cached_archive,
+    load_geojson_text,
+    merge_route_features,
+    render_map_html,
+    save_cached_archive,
+    write_raw_archive_files,
+    year_for_activity,
+)
+from .render import is_run
 from .state import load_state, save_state
-from .strava import StravaClient
+from .strava import (
+    StravaClient,
+    StravaDailyRateLimitExceeded,
+    StravaRequestBudgetExceeded,
+    StravaShortRateLimitExceeded,
+)
 
 if TYPE_CHECKING:
     from .drive import DriveClient
@@ -20,6 +46,7 @@ if TYPE_CHECKING:
 APPDATA_STRAVA_TOKEN = "strava_token.json"
 APPDATA_SYNC_STATE = "sync_state.json"
 APPDATA_RUN_HISTORY = "run_history.json"
+APPDATA_RAW_MANIFEST = "raw_manifest.json"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -30,12 +57,33 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("auth-google", help="Authorize Google Drive and store the OAuth token locally.")
     subparsers.add_parser("bootstrap-appdata", help="Upload the local Strava token into hidden Google Drive app data.")
 
-    sync = subparsers.add_parser("sync-strava", help="Fetch Strava runs and publish the Drive corpus.")
+    sync = subparsers.add_parser("sync-strava", help="Fetch included Strava activities and publish the Drive corpus.")
     sync.add_argument("--days", type=int, default=14, help="How many days of Strava history to inspect.")
     sync.add_argument("--max-pages", type=int, default=5, help="Maximum Strava pages to fetch, 200 activities each.")
     sync.add_argument("--no-upload", action="store_true", help="Write local files and state but skip visible Drive uploads.")
     sync.add_argument("--dry-run", action="store_true", help="Print what would happen without writing or uploading.")
     sync.add_argument("--force-upload", action="store_true", help="Rewrite visible Drive files even if run history is unchanged.")
+    sync.add_argument(
+        "--enrich",
+        choices=["none", "missing", "full"],
+        default="missing",
+        help="Fetch detailed activity and stream data: none, missing cached runs, or every fetched run.",
+    )
+    sync.add_argument(
+        "--publish-raw",
+        dest="publish_raw",
+        action="store_true",
+        default=None,
+        help="Publish detailed raw archive files into the visible Raw Data Drive subfolder.",
+    )
+    sync.add_argument(
+        "--no-publish-raw",
+        dest="publish_raw",
+        action="store_false",
+        help="Skip visible Raw Data archive publishing.",
+    )
+    sync.add_argument("--recent-mile-days", type=int, default=14, help="Days of mile splits to expose in top-level files.")
+    sync.add_argument("--request-budget", type=int, default=900, help="Maximum Strava API requests to spend on this run.")
     sync.add_argument(
         "--state-backend",
         choices=["auto", "local", "drive"],
@@ -97,6 +145,9 @@ def bootstrap_appdata(settings: Settings) -> int:
     existing_history = drive.get_appdata_json(APPDATA_RUN_HISTORY)
     if existing_history is None:
         drive.put_appdata_json(APPDATA_RUN_HISTORY, run_history_payload([]))
+    existing_manifest = drive.get_appdata_json(APPDATA_RAW_MANIFEST)
+    if existing_manifest is None:
+        drive.put_appdata_json(APPDATA_RAW_MANIFEST, {"schema_version": 1, "files": {}})
     print(f"Uploaded {APPDATA_STRAVA_TOKEN} to hidden Google Drive app data.")
     print("GitHub Actions can now refresh and persist Strava tokens without using your PC.")
     return 0
@@ -108,6 +159,7 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
 
     backend = resolve_state_backend(args.state_backend or settings.state_backend)
     drive = drive_client(settings) if backend == "drive" or not args.no_upload else None
+    publish_raw = args.publish_raw if args.publish_raw is not None else backend == "drive"
     strava_token = load_strava_token(settings, backend=backend, drive=drive)
 
     after = datetime.now(timezone.utc) - timedelta(days=args.days)
@@ -119,11 +171,24 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
         settings.strava_token_file if backend == "local" else None,
         token=strava_token,
         on_token_update=(lambda token: save_strava_token(settings, token, backend=backend, drive=drive)),
+        request_budget=args.request_budget,
     )
     activities = strava.iter_activities(after_epoch=after_epoch, max_pages=args.max_pages)
-    fetched_runs = normalize_runs(activities)
+    existing_history = load_run_history(settings, backend=backend, drive=drive)
+    existing_runs = runs_from_history(existing_history)
+    existing_runs_by_id = {
+        str(run.get("source_activity_id")): run
+        for run in existing_runs
+        if isinstance(run, dict) and run.get("source_activity_id")
+    }
+    enrich_args = argparse.Namespace(**vars(args))
+    if args.dry_run:
+        enrich_args.enrich = "none"
+    fetched_runs, archives, enrich_status = prepare_fetched_runs(settings, enrich_args, strava, activities, existing_runs_by_id)
 
-    print(f"Fetched {len(activities)} Strava activities; {len(fetched_runs)} are runs.")
+    print(f"Fetched {len(activities)} Strava activities; {len(fetched_runs)} are included activities.")
+    if enrich_status:
+        print(enrich_status)
     if args.dry_run:
         for run in fetched_runs[:20]:
             print(f"- {run.get('local_date')} {run.get('name')} ({run.get('source_activity_id')})")
@@ -131,31 +196,45 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
             print(f"...and {len(fetched_runs) - 20} more")
         return 0
 
-    existing_history = load_run_history(settings, backend=backend, drive=drive)
-    existing_runs = runs_from_history(existing_history)
     merged_runs = merge_run_history(existing_history, fetched_runs)
     current_digest = run_history_digest(merged_runs)
     sync_state = load_sync_state(settings, backend=backend, drive=drive)
+    raw_manifest = load_raw_manifest(settings, backend=backend, drive=drive)
     should_publish = args.force_upload or sync_state.get("last_published_digest") != current_digest
 
     generated_files = []
+    route_features = build_route_collection(settings, drive, publish_raw=publish_raw and not args.no_upload, archives=archives)
     if args.no_upload or should_publish:
         generated_files = render_corpus(
             merged_runs,
             settings.output_dir,
             markdown_as_google_docs=settings.google_upload_as_google_docs,
+            recent_mile_days=args.recent_mile_days,
+            route_features=route_features,
         )
+    raw_files: list[GeneratedFile] = []
+    if publish_raw and (args.no_upload or should_publish or archives):
+        raw_files = render_raw_outputs(settings, archives, route_features)
+        generated_files.extend(raw_files)
 
     if merged_runs != existing_runs:
         save_run_history(settings, merged_runs, backend=backend, drive=drive)
 
     uploaded_count = 0
     if not args.no_upload:
-        if should_publish:
+        if should_publish or raw_files:
             if drive is None:
                 drive = drive_client(settings)
-            uploaded_count = upload_generated_files(settings, drive, generated_files)
+            uploaded_count = upload_generated_files(
+                settings,
+                drive,
+                generated_files,
+                raw_manifest=raw_manifest,
+                force_upload=args.force_upload,
+            )
             print(f"Uploaded or updated {uploaded_count} visible Drive files.")
+            if publish_raw:
+                save_raw_manifest(settings, raw_manifest, backend=backend, drive=drive)
             sync_state["last_published_digest"] = current_digest
             sync_state["last_published_at"] = datetime.now(timezone.utc).isoformat()
         else:
@@ -167,14 +246,15 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
             "state_backend": backend,
             "last_strava_days": args.days,
             "last_strava_activity_count": len(activities),
-            "last_strava_run_count": len(fetched_runs),
+            "last_strava_included_activity_count": len(fetched_runs),
+            "last_enriched_included_activity_count": sum(1 for run in fetched_runs if run.get("enriched")),
             "stored_run_count": len(merged_runs),
             "current_history_digest": current_digest,
         }
     )
     save_sync_state(settings, sync_state, backend=backend, drive=drive)
 
-    print(f"Stored run history contains {len(merged_runs)} runs.")
+    print(f"Stored history contains {len(merged_runs)} included activities.")
     print(f"Local output: {settings.output_dir}")
     return 0
 
@@ -183,6 +263,193 @@ def drive_client(settings: Settings) -> DriveClient:
     from .drive import DriveClient
 
     return DriveClient(settings.google_client_secret_file, settings.google_token_file, settings.google_token_json)
+
+
+def prepare_fetched_runs(
+    settings: Settings,
+    args: argparse.Namespace,
+    strava: StravaClient,
+    activities: list[dict[str, Any]],
+    existing_runs_by_id: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
+    runs: list[dict[str, Any]] = []
+    archives: list[dict[str, Any]] = []
+
+    for activity in activities:
+        if not is_run(activity):
+            continue
+
+        summary_run = normalize_activity(activity)
+        activity_id = str(summary_run["source_activity_id"])
+        existing_run = existing_runs_by_id.get(activity_id)
+        run = merge_existing_enrichment(summary_run, existing_run)
+
+        if should_enrich_run(args.enrich, run):
+            try:
+                archive = load_or_fetch_archive(settings, strava, activity, force_fetch=args.enrich == "full")
+            except (StravaRequestBudgetExceeded, StravaDailyRateLimitExceeded, StravaShortRateLimitExceeded) as exc:
+                runs.append(run)
+                return runs, archives, str(exc)
+            except requests.HTTPError as exc:
+                print(f"Skipped enrichment for Strava activity {activity_id}: {http_error_label(exc)}")
+                archive = None
+
+            if archive:
+                archive_activity = archive.get("activity") if isinstance(archive.get("activity"), dict) else activity
+                run = merge_existing_enrichment(normalize_activity(archive_activity), existing_run)
+                run.update(archive_enrichment_fields(archive))
+                archives.append(archive)
+
+        runs.append(run)
+
+    return runs, archives, None
+
+
+def should_enrich_run(enrich_mode: str, run: dict[str, Any]) -> bool:
+    if enrich_mode == "none":
+        return False
+    if enrich_mode == "full":
+        return True
+    return not run.get("enriched") or not run.get("raw_data_path")
+
+
+def merge_existing_enrichment(summary_run: dict[str, Any], existing_run: dict[str, Any] | None) -> dict[str, Any]:
+    if not existing_run:
+        return summary_run
+    merged = dict(existing_run)
+    merged.update(summary_run)
+    for key in [
+        "enriched",
+        "enriched_at",
+        "stream_types",
+        "stream_sample_count",
+        "mile_splits",
+        "mile_split_count",
+        "route_available",
+        "raw_data_path",
+        "route_geojson_path",
+    ]:
+        if key in existing_run:
+            merged[key] = existing_run[key]
+    return merged
+
+
+def load_or_fetch_archive(
+    settings: Settings,
+    strava: StravaClient,
+    activity: dict[str, Any],
+    *,
+    force_fetch: bool,
+) -> dict[str, Any]:
+    activity_id = str(activity["id"])
+    year = year_for_activity(activity)
+    if not force_fetch:
+        cached = load_cached_archive(settings.data_dir, activity_id, year)
+        if cached:
+            return cached
+
+    detailed = strava.get_activity(activity_id)
+    try:
+        streams = strava.get_activity_streams(activity_id)
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code in {403, 404}:
+            print(f"Streams unavailable for Strava activity {activity_id}; archiving detailed activity only.")
+            streams = {}
+        else:
+            raise
+
+    archive = build_raw_archive(detailed, streams)
+    save_cached_archive(settings.data_dir, archive)
+    return archive
+
+
+def http_error_label(exc: requests.HTTPError) -> str:
+    if exc.response is None:
+        return str(exc)
+    return f"HTTP {exc.response.status_code} {exc.response.reason}"
+
+
+def build_route_collection(
+    settings: Settings,
+    drive: DriveClient | None,
+    *,
+    publish_raw: bool,
+    archives: list[dict[str, Any]],
+) -> dict[str, Any]:
+    existing_routes = None
+    if publish_raw and drive is not None:
+        folder = drive.get_or_create_folder(settings.google_drive_folder_name, settings.google_drive_folder_id)
+        existing_routes = load_geojson_text(
+            drive.get_text_file_by_path(folder["id"], (RAW_DATA_DIR,), ALL_ROUTES_NAME)
+        )
+    else:
+        local_routes = settings.output_dir / RAW_DATA_DIR / ALL_ROUTES_NAME
+        if local_routes.exists():
+            existing_routes = load_geojson_text(local_routes.read_text(encoding="utf-8"))
+
+    new_features = [
+        archive["route"]
+        for archive in archives
+        if isinstance(archive.get("route"), dict)
+    ]
+    return merge_route_features(existing_routes, new_features)
+
+
+def render_raw_outputs(settings: Settings, archives: list[dict[str, Any]], route_features: dict[str, Any]) -> list[GeneratedFile]:
+    generated: list[GeneratedFile] = []
+    seen_paths: set[Path] = set()
+
+    for archive in archives:
+        for path in write_raw_archive_files(settings.output_dir, archive):
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            generated.append(generated_file_from_path(settings.output_dir, path))
+
+    raw_dir = settings.output_dir / RAW_DATA_DIR
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    generated.append(
+        write_generated(
+            raw_dir / ALL_ROUTES_NAME,
+            json.dumps(route_features, indent=2, sort_keys=True) + "\n",
+            remote_name=ALL_ROUTES_NAME,
+            mime_type="application/geo+json",
+            as_google_doc=False,
+            remote_folder_parts=(RAW_DATA_DIR,),
+        )
+    )
+    generated.append(
+        write_generated(
+            raw_dir / ALL_MAP_NAME,
+            render_map_html("All Runs Map", route_features),
+            remote_name=ALL_MAP_NAME,
+            mime_type="text/html",
+            as_google_doc=False,
+            remote_folder_parts=(RAW_DATA_DIR,),
+        )
+    )
+    return generated
+
+
+def generated_file_from_path(output_dir: Path, path: Path) -> GeneratedFile:
+    relative_parts = path.relative_to(output_dir).parts
+    suffix = path.suffix.lower()
+    if suffix == ".geojson":
+        mime_type = "application/geo+json"
+    elif suffix == ".json":
+        mime_type = "application/json"
+    elif suffix == ".html":
+        mime_type = "text/html"
+    else:
+        mime_type = "text/plain"
+    return GeneratedFile(
+        path=path,
+        remote_name=relative_parts[-1],
+        mime_type=mime_type,
+        as_google_doc=False,
+        changed=True,
+        remote_folder_parts=tuple(relative_parts[:-1]),
+    )
 
 
 def resolve_state_backend(value: str) -> str:
@@ -292,26 +559,96 @@ def save_sync_state(
     drive.put_appdata_json(APPDATA_SYNC_STATE, state)
 
 
+def load_raw_manifest(settings: Settings, *, backend: str, drive: DriveClient | None) -> dict[str, Any]:
+    if backend == "local":
+        state = load_state(settings.state_file)
+        manifest = state.get("raw_manifest")
+    else:
+        if drive is None:
+            raise RuntimeError("Drive state backend requires Google Drive credentials.")
+        manifest = drive.get_appdata_json(APPDATA_RAW_MANIFEST)
+    if not isinstance(manifest, dict):
+        return {"schema_version": 1, "files": {}}
+    manifest.setdefault("schema_version", 1)
+    manifest.setdefault("files", {})
+    return manifest
+
+
+def save_raw_manifest(
+    settings: Settings,
+    manifest: dict[str, Any],
+    *,
+    backend: str,
+    drive: DriveClient | None,
+) -> None:
+    manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if backend == "local":
+        state = load_state(settings.state_file)
+        state["raw_manifest"] = manifest
+        save_state(settings.state_file, state)
+        return
+    if drive is None:
+        raise RuntimeError("Drive state backend requires Google Drive credentials.")
+    drive.put_appdata_json(APPDATA_RAW_MANIFEST, manifest)
+
+
 def run_history_digest(runs: list[dict[str, Any]]) -> str:
     content = json.dumps(runs, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def upload_generated_files(settings: Settings, drive: DriveClient, generated_files: list) -> int:
+def upload_generated_files(
+    settings: Settings,
+    drive: DriveClient,
+    generated_files: list[GeneratedFile],
+    *,
+    raw_manifest: dict[str, Any] | None = None,
+    force_upload: bool = False,
+) -> int:
     folder = drive.get_or_create_folder(settings.google_drive_folder_name, settings.google_drive_folder_id)
     folder_id = folder["id"]
+    folder_cache: dict[tuple[str, ...], str] = {(): folder_id}
 
     count = 0
     for generated in generated_files:
+        remote_parts = generated.remote_folder_parts
+        manifest_key = "/".join((*remote_parts, generated.remote_name))
+        if should_skip_raw_upload(manifest_key, raw_manifest, force_upload):
+            continue
+        target_folder_id = folder_cache.get(remote_parts)
+        if target_folder_id is None:
+            target_folder = drive.get_or_create_folder_path(folder_id, remote_parts)
+            target_folder_id = target_folder["id"]
+            folder_cache[remote_parts] = target_folder_id
+
         drive.upload_text_file(
             generated.path,
-            folder_id=folder_id,
+            folder_id=target_folder_id,
             remote_name=generated.remote_name,
             as_google_doc=generated.as_google_doc,
             mime_type=generated.mime_type,
         )
+        if raw_manifest is not None and remote_parts:
+            raw_manifest.setdefault("files", {})[manifest_key] = {
+                "uploaded_at": datetime.now(timezone.utc).isoformat(),
+                "local_path": str(generated.path),
+                "mime_type": generated.mime_type,
+            }
         count += 1
     return count
+
+
+def should_skip_raw_upload(manifest_key: str, raw_manifest: dict[str, Any] | None, force_upload: bool) -> bool:
+    if force_upload or raw_manifest is None:
+        return False
+    if manifest_key in {f"{RAW_DATA_DIR}/{ALL_ROUTES_NAME}", f"{RAW_DATA_DIR}/{ALL_MAP_NAME}"}:
+        return False
+    if not (
+        manifest_key.startswith(f"{RAW_DATA_DIR}/{RAW_RUNS_DIR}/")
+        or manifest_key.startswith(f"{RAW_DATA_DIR}/{RAW_ROUTES_DIR}/")
+    ):
+        return False
+    return manifest_key in raw_manifest.get("files", {})
 
 
 if __name__ == "__main__":

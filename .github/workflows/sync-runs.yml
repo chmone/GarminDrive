@@ -17,6 +17,10 @@ on:
         description: "Rewrite visible Drive files even if history is unchanged"
         required: false
         default: "false"
+      request_budget:
+        description: "Max Strava API requests to spend"
+        required: false
+        default: "900"
 
 concurrency:
   group: run-history-sync
@@ -28,11 +32,12 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
     env:
       STRAVA_CLIENT_ID: ${{ secrets.STRAVA_CLIENT_ID }}
       STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}
       STRAVA_SCOPE: activity:read_all
+      STRAVA_ACTIVITY_SPORT_TYPES: Run,TrailRun,VirtualRun,Treadmill,TrackRun,Ride,VirtualRide,MountainBikeRide,GravelRide,EBikeRide,EMountainBikeRide
       STRAVA_TOKEN_JSON_BOOTSTRAP: ${{ secrets.STRAVA_TOKEN_JSON_BOOTSTRAP }}
       GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
       GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
@@ -60,8 +65,10 @@ jobs:
           days="${{ github.event.inputs.days }}"
           max_pages="${{ github.event.inputs.max_pages }}"
           force_upload="${{ github.event.inputs.force_upload }}"
+          request_budget="${{ github.event.inputs.request_budget }}"
           if [ -z "$days" ]; then days="14"; fi
           if [ -z "$max_pages" ]; then max_pages="5"; fi
-          args=(sync-strava --days "$days" --max-pages "$max_pages")
+          if [ -z "$request_budget" ]; then request_budget="900"; fi
+          args=(sync-strava --days "$days" --max-pages "$max_pages" --enrich missing --publish-raw --recent-mile-days 14 --request-budget "$request_budget")
           if [ "$force_upload" = "true" ]; then args+=(--force-upload); fi
           python -m garmin_drive "${args[@]}"

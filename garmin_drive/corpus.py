@@ -9,6 +9,14 @@ from io import StringIO
 from pathlib import Path
 from typing import Any
 
+from .deep_archive import (
+    RECENT_MAP_NAME,
+    compact_run_for_export,
+    feature_collection,
+    filter_routes_for_activity_ids,
+    recent_mile_split_rows,
+    render_map_html,
+)
 from .render import (
     format_duration,
     format_km,
@@ -33,6 +41,7 @@ class GeneratedFile:
     mime_type: str
     as_google_doc: bool
     changed: bool
+    remote_folder_parts: tuple[str, ...] = ()
 
 
 CSV_FIELDS = [
@@ -45,8 +54,34 @@ CSV_FIELDS = [
     "average_heartrate",
     "max_heartrate",
     "calories",
+    "enriched",
+    "mile_split_count",
+    "route_available",
+    "raw_data_path",
+    "route_geojson_path",
     "sport_type",
     "source_activity_id",
+    "strava_activity_url",
+]
+
+MILE_SPLIT_CSV_FIELDS = [
+    "local_date",
+    "name",
+    "source_activity_id",
+    "split_index",
+    "split_type",
+    "source",
+    "distance_miles",
+    "moving_time",
+    "pace_per_mile",
+    "average_heartrate",
+    "max_heartrate",
+    "elevation_gain_feet",
+    "elevation_loss_feet",
+    "net_elevation_change_feet",
+    "average_cadence",
+    "average_grade",
+    "route_available",
     "strava_activity_url",
 ]
 
@@ -133,9 +168,19 @@ def run_history_payload(runs: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def render_corpus(runs: list[dict[str, Any]], output_dir: Path, *, markdown_as_google_docs: bool) -> list[GeneratedFile]:
+def render_corpus(
+    runs: list[dict[str, Any]],
+    output_dir: Path,
+    *,
+    markdown_as_google_docs: bool,
+    recent_mile_days: int = 14,
+    route_features: dict[str, Any] | None = None,
+) -> list[GeneratedFile]:
     output_dir.mkdir(parents=True, exist_ok=True)
     generated: list[GeneratedFile] = []
+    compact_runs = [compact_run_for_export(run) for run in runs]
+    recent_split_rows = recent_mile_split_rows(runs, recent_days=recent_mile_days)
+    route_features = route_features or feature_collection([])
 
     generated.append(
         write_generated(
@@ -149,7 +194,7 @@ def render_corpus(runs: list[dict[str, Any]], output_dir: Path, *, markdown_as_g
     generated.append(
         write_generated(
             output_dir / "Run History Data.json",
-            json.dumps(run_history_payload(runs), indent=2, sort_keys=True) + "\n",
+            json.dumps(run_history_payload(compact_runs), indent=2, sort_keys=True) + "\n",
             remote_name="Run History Data.json",
             mime_type="application/json",
             as_google_doc=False,
@@ -158,9 +203,48 @@ def render_corpus(runs: list[dict[str, Any]], output_dir: Path, *, markdown_as_g
     generated.append(
         write_generated(
             output_dir / "Run History Data.csv",
-            render_csv(runs),
+            render_csv(compact_runs),
             remote_name="Run History Data.csv",
             mime_type="text/csv",
+            as_google_doc=False,
+        )
+    )
+    generated.append(
+        write_generated(
+            output_dir / "Recent Mile Splits.csv",
+            render_mile_split_csv(recent_split_rows),
+            remote_name="Recent Mile Splits.csv",
+            mime_type="text/csv",
+            as_google_doc=False,
+        )
+    )
+    generated.append(
+        write_generated(
+            output_dir / "Recent Mile Splits.json",
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "recent_days": recent_mile_days,
+                    "split_count": len(recent_split_rows),
+                    "mile_splits": recent_split_rows,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            remote_name="Recent Mile Splits.json",
+            mime_type="application/json",
+            as_google_doc=False,
+        )
+    )
+    recent_activity_ids = recent_activity_ids_for_runs(runs, recent_mile_days)
+    generated.append(
+        write_generated(
+            output_dir / RECENT_MAP_NAME,
+            render_map_html("Recent Run Map", filter_routes_for_activity_ids(route_features, recent_activity_ids)),
+            remote_name=RECENT_MAP_NAME,
+            mime_type="text/html",
             as_google_doc=False,
         )
     )
@@ -275,9 +359,46 @@ def render_csv(runs: list[dict[str, Any]]) -> str:
     return buffer.getvalue()
 
 
-def write_generated(path: Path, content: str, *, remote_name: str, mime_type: str, as_google_doc: bool) -> GeneratedFile:
+def render_mile_split_csv(rows: list[dict[str, Any]]) -> str:
+    buffer = StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=MILE_SPLIT_CSV_FIELDS, extrasaction="ignore", lineterminator="\n")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return buffer.getvalue()
+
+
+def recent_activity_ids_for_runs(runs: list[dict[str, Any]], recent_days: int) -> set[str]:
+    cutoff = date.today().toordinal() - max(0, recent_days - 1)
+    activity_ids: set[str] = set()
+    for run in runs:
+        run_date = parse_local_date(run)
+        if run_date is None or run_date.toordinal() < cutoff:
+            continue
+        activity_id = run.get("source_activity_id")
+        if activity_id:
+            activity_ids.add(str(activity_id))
+    return activity_ids
+
+
+def write_generated(
+    path: Path,
+    content: str,
+    *,
+    remote_name: str,
+    mime_type: str,
+    as_google_doc: bool,
+    remote_folder_parts: tuple[str, ...] = (),
+) -> GeneratedFile:
     changed = write_if_changed(path, content)
-    return GeneratedFile(path=path, remote_name=remote_name, mime_type=mime_type, as_google_doc=as_google_doc, changed=changed)
+    return GeneratedFile(
+        path=path,
+        remote_name=remote_name,
+        mime_type=mime_type,
+        as_google_doc=as_google_doc,
+        changed=changed,
+        remote_folder_parts=remote_folder_parts,
+    )
 
 
 def run_table_row(run: dict[str, Any], *, include_link: bool = False) -> str:
