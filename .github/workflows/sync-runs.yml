@@ -1,8 +1,11 @@
 name: Sync Activity History
 
 on:
-  schedule:
-    - cron: "3,13,23,33,43,53 * * * *"
+  # Scheduled syncing now runs on Render (reliable cron). The GitHub schedule is
+  # disabled to avoid double-firing against the same Drive folder. Re-enable by
+  # uncommenting if you ever move scheduling back here.
+  # schedule:
+  #   - cron: "3,13,23,33,43,53 * * * *"
   workflow_dispatch:
     inputs:
       days:
