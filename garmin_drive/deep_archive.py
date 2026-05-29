@@ -23,8 +23,6 @@ RAW_DATA_DIR = "Raw Data"
 RAW_RUNS_DIR = "Runs"
 RAW_ROUTES_DIR = "Routes"
 ALL_ROUTES_NAME = "All Run Routes.geojson"
-ALL_MAP_NAME = "All Runs Map.html"
-RECENT_MAP_NAME = "Recent Run Map.html"
 STREAM_KEYS = [
     "time",
     "distance",
@@ -389,56 +387,6 @@ def filter_routes_for_activity_ids(routes: dict[str, Any], activity_ids: set[str
     return feature_collection(features)
 
 
-def render_map_html(title: str, routes: dict[str, Any]) -> str:
-    route_json = json.dumps(routes, separators=(",", ":")).replace("</", "<\\/")
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{html_escape(title)}</title>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-  <style>
-    html, body, #map {{ height: 100%; margin: 0; }}
-    body {{ font-family: Arial, sans-serif; }}
-    #empty {{ padding: 24px; }}
-  </style>
-</head>
-<body>
-  <div id="map"></div>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script>
-    const routes = {route_json};
-    const map = L.map("map");
-    L.tileLayer("https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
-      maxZoom: 19,
-      attribution: "&copy; OpenStreetMap contributors"
-    }}).addTo(map);
-    const layer = L.geoJSON(routes, {{
-      style: {{ color: "#e64626", weight: 3, opacity: 0.72 }},
-      onEachFeature: (feature, item) => {{
-        const p = feature.properties || {{}};
-        const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({{
-          "&": "&amp;",
-          "<": "&lt;",
-          ">": "&gt;",
-          '"': "&quot;",
-          "'": "&#39;"
-        }}[char]));
-        item.bindPopup(`<strong>${{escapeHtml(p.local_date)}}</strong><br>${{escapeHtml(p.name || "Run")}}<br>${{escapeHtml(p.distance_miles)}} mi`);
-      }}
-    }}).addTo(map);
-    if (layer.getLayers().length) {{
-      map.fitBounds(layer.getBounds(), {{ padding: [24, 24] }});
-    }} else {{
-      document.body.innerHTML = '<div id="empty">No route data available.</div>';
-    }}
-  </script>
-</body>
-</html>
-"""
-
-
 def compact_run_for_export(run: dict[str, Any]) -> dict[str, Any]:
     compact = {key: value for key, value in run.items() if key != "mile_splits"}
     if run.get("mile_splits"):
@@ -574,16 +522,6 @@ def parse_date(value: str) -> date | None:
         return date.fromisoformat(value)
     except ValueError:
         return None
-
-
-def html_escape(value: str) -> str:
-    return (
-        value.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-        .replace("'", "&#39;")
-    )
 
 
 def slugify_filename(value: str) -> str:

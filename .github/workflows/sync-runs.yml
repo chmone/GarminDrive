@@ -1,4 +1,4 @@
-name: Sync Run History
+name: Sync Activity History
 
 on:
   schedule:
@@ -59,7 +59,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Sync Strava runs to Google Drive
+      - name: Sync Strava activities to Google Drive
         shell: bash
         run: |
           days="${{ github.event.inputs.days }}"

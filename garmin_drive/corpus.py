@@ -9,14 +9,7 @@ from io import StringIO
 from pathlib import Path
 from typing import Any
 
-from .deep_archive import (
-    RECENT_MAP_NAME,
-    compact_run_for_export,
-    feature_collection,
-    filter_routes_for_activity_ids,
-    recent_mile_split_rows,
-    render_map_html,
-)
+from .deep_archive import compact_run_for_export, recent_mile_split_rows
 from .render import (
     format_duration,
     format_km,
@@ -174,13 +167,11 @@ def render_corpus(
     *,
     markdown_as_google_docs: bool,
     recent_mile_days: int = 14,
-    route_features: dict[str, Any] | None = None,
 ) -> list[GeneratedFile]:
     output_dir.mkdir(parents=True, exist_ok=True)
     generated: list[GeneratedFile] = []
     compact_runs = [compact_run_for_export(run) for run in runs]
     recent_split_rows = recent_mile_split_rows(runs, recent_days=recent_mile_days)
-    route_features = route_features or feature_collection([])
 
     generated.append(
         write_generated(
@@ -238,17 +229,6 @@ def render_corpus(
             as_google_doc=False,
         )
     )
-    recent_activity_ids = recent_activity_ids_for_runs(runs, recent_mile_days)
-    generated.append(
-        write_generated(
-            output_dir / RECENT_MAP_NAME,
-            render_map_html("Recent Run Map", filter_routes_for_activity_ids(route_features, recent_activity_ids)),
-            remote_name=RECENT_MAP_NAME,
-            mime_type="text/html",
-            as_google_doc=False,
-        )
-    )
-
     for year, year_runs in group_by_year(runs).items():
         generated.append(
             write_generated(
@@ -366,19 +346,6 @@ def render_mile_split_csv(rows: list[dict[str, Any]]) -> str:
     for row in rows:
         writer.writerow(row)
     return buffer.getvalue()
-
-
-def recent_activity_ids_for_runs(runs: list[dict[str, Any]], recent_days: int) -> set[str]:
-    cutoff = date.today().toordinal() - max(0, recent_days - 1)
-    activity_ids: set[str] = set()
-    for run in runs:
-        run_date = parse_local_date(run)
-        if run_date is None or run_date.toordinal() < cutoff:
-            continue
-        activity_id = run.get("source_activity_id")
-        if activity_id:
-            activity_ids.add(str(activity_id))
-    return activity_ids
 
 
 def write_generated(

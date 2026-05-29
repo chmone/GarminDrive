@@ -15,21 +15,29 @@ import requests
 from .config import Settings, ensure_local_dirs, get_settings
 from .corpus import GeneratedFile, merge_run_history, normalize_activity, render_corpus, run_history_payload, write_generated
 from .deep_archive import (
-    ALL_MAP_NAME,
     ALL_ROUTES_NAME,
     RAW_DATA_DIR,
     RAW_ROUTES_DIR,
     RAW_RUNS_DIR,
     archive_enrichment_fields,
     build_raw_archive,
-    feature_collection,
     load_cached_archive,
     load_geojson_text,
     merge_route_features,
-    render_map_html,
     save_cached_archive,
     write_raw_archive_files,
     year_for_activity,
+)
+from .heatmap import (
+    ALL_TIME_ACTIVITY_MAP_NAME,
+    HEATMAP_STATE_NAME,
+    RAW_HEATMAP_DIR,
+    RECENT_ACTIVITY_MAP_NAME,
+    contributions_from_archives,
+    heatmap_state_from_archives,
+    load_heatmap_state_text,
+    merge_heatmap_state,
+    render_activity_map_html,
 )
 from .render import is_run
 from .state import load_state, save_state
@@ -228,19 +236,34 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
     sync_state = load_sync_state(settings, backend=backend, drive=drive)
     raw_manifest = load_raw_manifest(settings, backend=backend, drive=drive)
     should_publish = args.force_upload or sync_state.get("last_published_digest") != current_digest
+    should_render_outputs = args.no_upload or should_publish or bool(archives)
 
     generated_files = []
     route_features = build_route_collection(settings, drive, publish_raw=publish_raw and not args.no_upload, archives=archives)
-    if args.no_upload or should_publish:
+    heatmap_state = build_heatmap_state_collection(
+        settings,
+        drive,
+        publish_raw=publish_raw and not args.no_upload,
+        archives=archives,
+        rebuild=False,
+    )
+    if should_render_outputs:
         generated_files = render_corpus(
             merged_runs,
             settings.output_dir,
             markdown_as_google_docs=settings.google_upload_as_google_docs,
             recent_mile_days=args.recent_mile_days,
-            route_features=route_features,
+        )
+        generated_files.extend(
+            render_heatmap_outputs(
+                settings,
+                heatmap_state,
+                recent_days=args.recent_mile_days,
+                include_raw_state=publish_raw or args.no_upload,
+            )
         )
     raw_files: list[GeneratedFile] = []
-    if publish_raw and (args.no_upload or should_publish or archives):
+    if publish_raw and should_render_outputs:
         raw_files = render_raw_outputs(settings, archives, route_features)
         generated_files.extend(raw_files)
 
@@ -248,8 +271,9 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
         save_run_history(settings, merged_runs, backend=backend, drive=drive)
 
     uploaded_count = 0
+    trashed_map_count = 0
     if not args.no_upload:
-        if should_publish or raw_files:
+        if generated_files and should_render_outputs:
             if drive is None:
                 drive = drive_client(settings)
             uploaded_count = upload_generated_files(
@@ -260,6 +284,9 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
                 force_upload=args.force_upload,
             )
             print(f"Uploaded or updated {uploaded_count} visible Drive files.")
+            if generated_activity_maps(generated_files):
+                folder = drive.get_or_create_folder(settings.google_drive_folder_name, settings.google_drive_folder_id)
+                trashed_map_count = trash_legacy_map_html_files(drive, folder["id"])
             if publish_raw:
                 save_raw_manifest(settings, raw_manifest, backend=backend, drive=drive)
             sync_state["last_published_digest"] = current_digest
@@ -281,6 +308,8 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
     )
     save_sync_state(settings, sync_state, backend=backend, drive=drive)
 
+    if trashed_map_count:
+        print(f"Moved {trashed_map_count} legacy route-only map HTML files to trash.")
     print(f"Stored history contains {len(merged_runs)} included activities.")
     print(f"Local output: {settings.output_dir}")
     return 0
@@ -305,18 +334,33 @@ def publish_cache(settings: Settings, args: argparse.Namespace) -> int:
 
     merged_runs = merge_run_history(existing_history, cached_runs)
     route_features = build_route_collection(settings, drive, publish_raw=not args.no_upload, archives=archives)
+    heatmap_state = build_heatmap_state_collection(
+        settings,
+        drive,
+        publish_raw=not args.no_upload,
+        archives=archives,
+        rebuild=True,
+    )
     generated_files = render_corpus(
         merged_runs,
         settings.output_dir,
         markdown_as_google_docs=settings.google_upload_as_google_docs,
         recent_mile_days=args.recent_mile_days,
-        route_features=route_features,
+    )
+    generated_files.extend(
+        render_heatmap_outputs(
+            settings,
+            heatmap_state,
+            recent_days=args.recent_mile_days,
+            include_raw_state=True,
+        )
     )
     generated_files.extend(render_raw_outputs(settings, archives, route_features))
 
     removed_local = remove_legacy_id_only_local_raw_files(settings.output_dir) if args.cleanup_local_id_only_raw else 0
     uploaded_count = 0
     trashed_count = 0
+    trashed_map_count = 0
     raw_manifest = load_raw_manifest(settings, backend=backend, drive=drive)
     if not args.no_upload:
         if drive is None:
@@ -331,6 +375,9 @@ def publish_cache(settings: Settings, args: argparse.Namespace) -> int:
         if args.trash_id_only_raw:
             folder = drive.get_or_create_folder(settings.google_drive_folder_name, settings.google_drive_folder_id)
             trashed_count = trash_legacy_id_only_raw_files(drive, folder["id"], raw_manifest)
+        if generated_activity_maps(generated_files):
+            folder = drive.get_or_create_folder(settings.google_drive_folder_name, settings.google_drive_folder_id)
+            trashed_map_count = trash_legacy_map_html_files(drive, folder["id"])
         save_raw_manifest(settings, raw_manifest, backend=backend, drive=drive)
 
     save_run_history(settings, merged_runs, backend=backend, drive=drive)
@@ -349,6 +396,8 @@ def publish_cache(settings: Settings, args: argparse.Namespace) -> int:
     print(f"Uploaded or updated {uploaded_count} Drive files.")
     if trashed_count:
         print(f"Moved {trashed_count} legacy ID-only raw Drive files to trash.")
+    if trashed_map_count:
+        print(f"Moved {trashed_map_count} legacy route-only map HTML files to trash.")
     if removed_local:
         print(f"Removed {removed_local} legacy ID-only local raw output files.")
     print(f"Local output: {settings.output_dir}")
@@ -418,6 +467,30 @@ def trash_legacy_id_only_raw_files(drive: DriveClient, root_folder_id: str, raw_
                 raw_manifest.get("files", {}).pop(manifest_key, None)
                 trashed += 1
     return trashed
+
+
+def trash_legacy_map_html_files(drive: DriveClient, root_folder_id: str) -> int:
+    trashed = 0
+    trashed += trash_named_files_in_folder(drive, root_folder_id, {"Recent Run Map.html"})
+    raw_folder = drive.find_folder_path(root_folder_id, (RAW_DATA_DIR,))
+    if raw_folder:
+        trashed += trash_named_files_in_folder(drive, raw_folder["id"], {"All Runs Map.html"})
+    return trashed
+
+
+def trash_named_files_in_folder(drive: DriveClient, folder_id: str, names: set[str]) -> int:
+    trashed = 0
+    for item in drive.list_files_in_folder(folder_id):
+        if str(item.get("name") or "") not in names:
+            continue
+        drive.trash_file(item["id"])
+        trashed += 1
+    return trashed
+
+
+def generated_activity_maps(generated_files: list[GeneratedFile]) -> bool:
+    generated_names = {generated.remote_name for generated in generated_files}
+    return RECENT_ACTIVITY_MAP_NAME in generated_names and ALL_TIME_ACTIVITY_MAP_NAME in generated_names
 
 
 def has_named_raw_replacement(raw_manifest: dict[str, Any], folder_name: str, year: str, activity_id: str) -> bool:
@@ -571,6 +644,74 @@ def build_route_collection(
     return merge_route_features(existing_routes, new_features)
 
 
+def build_heatmap_state_collection(
+    settings: Settings,
+    drive: DriveClient | None,
+    *,
+    publish_raw: bool,
+    archives: list[dict[str, Any]],
+    rebuild: bool,
+) -> dict[str, Any]:
+    if rebuild:
+        return heatmap_state_from_archives(archives)
+
+    existing_state = None
+    if publish_raw and drive is not None:
+        folder = drive.get_or_create_folder(settings.google_drive_folder_name, settings.google_drive_folder_id)
+        existing_state = load_heatmap_state_text(
+            drive.get_text_file_by_path(folder["id"], (RAW_DATA_DIR, RAW_HEATMAP_DIR), HEATMAP_STATE_NAME)
+        )
+    else:
+        local_state = settings.output_dir / RAW_DATA_DIR / RAW_HEATMAP_DIR / HEATMAP_STATE_NAME
+        if local_state.exists():
+            existing_state = load_heatmap_state_text(local_state.read_text(encoding="utf-8"))
+
+    return merge_heatmap_state(existing_state, contributions_from_archives(archives))
+
+
+def render_heatmap_outputs(
+    settings: Settings,
+    heatmap_state: dict[str, Any],
+    *,
+    recent_days: int,
+    include_raw_state: bool,
+) -> list[GeneratedFile]:
+    generated = [
+        write_generated(
+            settings.output_dir / RECENT_ACTIVITY_MAP_NAME,
+            render_activity_map_html("Recent Activity Map", heatmap_state, recent_days=recent_days),
+            remote_name=RECENT_ACTIVITY_MAP_NAME,
+            mime_type="text/html",
+            as_google_doc=False,
+        ),
+        write_generated(
+            settings.output_dir / ALL_TIME_ACTIVITY_MAP_NAME,
+            render_activity_map_html("All Time Activity Map", heatmap_state),
+            remote_name=ALL_TIME_ACTIVITY_MAP_NAME,
+            mime_type="text/html",
+            as_google_doc=False,
+        ),
+    ]
+    state_dir = settings.output_dir / RAW_DATA_DIR / RAW_HEATMAP_DIR
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_content = json.dumps(heatmap_state, indent=2, sort_keys=True) + "\n"
+    state_path = state_dir / HEATMAP_STATE_NAME
+    if include_raw_state:
+        generated.append(
+            write_generated(
+                state_path,
+                state_content,
+                remote_name=HEATMAP_STATE_NAME,
+                mime_type="application/json",
+                as_google_doc=False,
+                remote_folder_parts=(RAW_DATA_DIR, RAW_HEATMAP_DIR),
+            )
+        )
+    else:
+        state_path.write_text(state_content, encoding="utf-8")
+    return generated
+
+
 def render_raw_outputs(settings: Settings, archives: list[dict[str, Any]], route_features: dict[str, Any]) -> list[GeneratedFile]:
     generated: list[GeneratedFile] = []
     seen_paths: set[Path] = set()
@@ -590,16 +731,6 @@ def render_raw_outputs(settings: Settings, archives: list[dict[str, Any]], route
             json.dumps(route_features, indent=2, sort_keys=True) + "\n",
             remote_name=ALL_ROUTES_NAME,
             mime_type="application/geo+json",
-            as_google_doc=False,
-            remote_folder_parts=(RAW_DATA_DIR,),
-        )
-    )
-    generated.append(
-        write_generated(
-            raw_dir / ALL_MAP_NAME,
-            render_map_html("All Runs Map", route_features),
-            remote_name=ALL_MAP_NAME,
-            mime_type="text/html",
             as_google_doc=False,
             remote_folder_parts=(RAW_DATA_DIR,),
         )
@@ -817,7 +948,7 @@ def upload_generated_files(
 def should_skip_raw_upload(manifest_key: str, raw_manifest: dict[str, Any] | None, force_upload: bool) -> bool:
     if force_upload or raw_manifest is None:
         return False
-    if manifest_key in {f"{RAW_DATA_DIR}/{ALL_ROUTES_NAME}", f"{RAW_DATA_DIR}/{ALL_MAP_NAME}"}:
+    if manifest_key == f"{RAW_DATA_DIR}/{ALL_ROUTES_NAME}":
         return False
     if not (
         manifest_key.startswith(f"{RAW_DATA_DIR}/{RAW_RUNS_DIR}/")

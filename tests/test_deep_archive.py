@@ -168,10 +168,12 @@ class DeepArchiveTests(unittest.TestCase):
             render_corpus([run], Path(temp_dir), markdown_as_google_docs=False)
             main_payload = json.loads((Path(temp_dir) / "Run History Data.json").read_text(encoding="utf-8"))
             recent_payload = json.loads((Path(temp_dir) / "Recent Mile Splits.json").read_text(encoding="utf-8"))
+            old_map_exists = (Path(temp_dir) / "Recent Run Map.html").exists()
 
         self.assertNotIn("mile_splits", main_payload["runs"][0])
         self.assertEqual(main_payload["runs"][0]["mile_split_count"], 1)
         self.assertEqual(recent_payload["split_count"], 1)
+        self.assertFalse(old_map_exists)
 
     def test_default_activity_filter_includes_runs_and_bikes(self) -> None:
         with patch.dict(os.environ, {}, clear=True):

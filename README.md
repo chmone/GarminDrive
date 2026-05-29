@@ -1,6 +1,6 @@
-# Garmin/Strava Run History to Google Drive
+# Garmin/Strava Activity History to Google Drive
 
-This project syncs running history into a Google Drive folder that ChatGPT can use as a source.
+This project syncs Strava activity history into a Google Drive folder that ChatGPT can use as a source.
 
 Recommended flow:
 
@@ -21,13 +21,14 @@ Visible folder, intended for ChatGPT:
 - `Run History Data.csv`
 - `Recent Mile Splits.json`
 - `Recent Mile Splits.csv`
-- `Recent Run Map.html`
+- `Recent Activity Map.html`
+- `All Time Activity Map.html`
 - yearly Google Docs such as `Runs 2026`
 - `Raw Data/`
   - `Runs/YYYY/{date}_{sport-and-name}_{activity_id}.json`, with detailed activity data, all available streams, derived mile splits, and fetch metadata
   - `Routes/YYYY/{date}_{sport-and-name}_{activity_id}.geojson`, with exact route geometry when Strava provides GPS data
   - `All Run Routes.geojson`
-  - `All Runs Map.html`
+  - `Heatmaps/All Time Activity Map Data.json`, with reusable per-activity heatmap and route contributions
 
 Hidden Google Drive app data, intended only for this app:
 
@@ -120,6 +121,8 @@ To re-publish the cache without making Strava API calls, including rewriting raw
 ```
 
 `-TrashOldIdFiles` moves older ID-only raw files in the Drive `Raw Data` folders to trash after uploading the new named files. Local `.data/raw_archive/` stays intact.
+
+The publisher also rebuilds `Recent Activity Map.html` and `All Time Activity Map.html` from the cached GPS streams. Those maps include activity-type filters, heatmap/route modes, and metric modes for frequency, speed, heart rate, steepness, and uphill/downhill bias. Older route-only map files are moved to trash after the new map files upload successfully.
 
 ## GitHub Actions Setup
 
