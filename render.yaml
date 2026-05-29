@@ -1,0 +1,37 @@
+# Render Blueprint: reliable scheduled Strava -> Google Drive sync.
+# Connect this repo as a Blueprint in the Render dashboard (New > Blueprint).
+# Non-secret config is inline; secrets are marked `sync: false` so Render prompts
+# you to enter them in the dashboard and they never live in this (public) repo.
+services:
+  - type: cron
+    name: garmin-drive-sync
+    runtime: python
+    region: ohio
+    plan: starter
+    schedule: "3,13,23,33,43,53 * * * *"
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python -m garmin_drive sync-strava --days 14 --max-pages 5 --enrich missing --publish-raw --recent-mile-days 14 --request-budget 900"
+    envVars:
+      # Must be "drive" on Render: auto-detect only picks Drive state under GitHub
+      # Actions, so without this the job would read an empty local disk and fail.
+      - key: GARMIN_DRIVE_STATE_BACKEND
+        value: drive
+      - key: STRAVA_SCOPE
+        value: activity:read_all
+      - key: STRAVA_ACTIVITY_SPORT_TYPES
+        value: Run,TrailRun,VirtualRun,Treadmill,TrackRun,Ride,VirtualRide,MountainBikeRide,GravelRide,EBikeRide,EMountainBikeRide
+      - key: GOOGLE_DRIVE_FOLDER_ID
+        value: 1Z3HkjUGhS87ln7kZYpDMUWP2CXZ3Eenw
+      - key: GOOGLE_DRIVE_FOLDER_NAME
+        value: Run History for ChatGPT
+      - key: GOOGLE_UPLOAD_AS_GOOGLE_DOCS
+        value: "true"
+      - key: PYTHON_VERSION
+        value: "3.12.9"
+      # Secrets: enter these in the Render dashboard, never commit them.
+      - key: STRAVA_CLIENT_ID
+        sync: false
+      - key: STRAVA_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_TOKEN_JSON
+        sync: false
