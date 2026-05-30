@@ -5,10 +5,11 @@ import os
 import tempfile
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from garmin_drive.__main__ import activity_sort_key, has_named_raw_replacement
+from garmin_drive.__main__ import activity_sort_key, has_named_raw_replacement, render_raw_outputs
 from garmin_drive.corpus import render_corpus
 from garmin_drive.deep_archive import (
     MILE_METERS,
@@ -232,6 +233,38 @@ class DeepArchiveTests(unittest.TestCase):
         self.assertTrue(has_named_raw_replacement(manifest, "Runs", "2026", "123"))
         self.assertTrue(has_named_raw_replacement(manifest, "Routes", "2026", "123"))
         self.assertFalse(has_named_raw_replacement(manifest, "Runs", "2026", "456"))
+
+    def test_render_raw_outputs_can_skip_all_routes_aggregate(self) -> None:
+        activity = {
+            "id": 123,
+            "name": "Evening Run!",
+            "sport_type": "Run",
+            "start_date_local": "2026-05-27T18:00:00Z",
+        }
+        route = {
+            "type": "Feature",
+            "id": "123",
+            "properties": {"source_activity_id": "123", "local_date": "2026-05-27"},
+            "geometry": {"type": "LineString", "coordinates": [[-75.0, 40.0], [-75.1, 40.1]]},
+        }
+        archive = {"source_activity_id": "123", "activity": activity, "streams": {}, "route": route}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            settings = SimpleNamespace(output_dir=output_dir)
+            generated = render_raw_outputs(
+                settings,
+                [archive],
+                {"type": "FeatureCollection", "features": [route]},
+                include_all_routes=False,
+            )
+            generated_paths = {str(item.path.relative_to(output_dir)).replace("\\", "/") for item in generated}
+            aggregate_exists = (output_dir / "Raw Data" / "All Run Routes.geojson").exists()
+
+        self.assertIn("Raw Data/Runs/2026/2026-05-27_run-evening-run_123.json", generated_paths)
+        self.assertIn("Raw Data/Routes/2026/2026-05-27_run-evening-run_123.geojson", generated_paths)
+        self.assertNotIn("Raw Data/All Run Routes.geojson", generated_paths)
+        self.assertFalse(aggregate_exists)
 
 
 if __name__ == "__main__":

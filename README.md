@@ -38,7 +38,9 @@ Visible folders, intended for ChatGPT:
   - `Raw Health/Health History Data.json`
   - `Raw Health/YYYY/YYYY-MM-DD.json`
 
-Local generated output mirrors the same structure under this repo's `Projects/` directory, which is ignored by git. ChatGPT-facing data is exported as Google Docs, Markdown, and CSV; machine-readable JSON is preserved under raw folders so the app does not lose archive detail.
+Local generated output is written under this repo's `Projects/` directory, which is ignored by git, whenever a sync renders outputs. ChatGPT-facing data is exported as Google Docs, Markdown, and CSV; machine-readable JSON is preserved under raw folders so the app does not lose archive detail.
+
+The sync skips visible Drive publishing when the hidden run-history digest is unchanged. After changing the generated output layout, run a one-time `--force-upload` sync to rebuild missing visible files such as `Run History Data.csv` or `Mile Splits Data.csv`.
 
 Hidden Google Drive app data, intended only for this app:
 
@@ -157,7 +159,7 @@ Connect this repo as a Render Blueprint using `render.yaml`.
 The blueprint defines:
 
 - `garmin-drive-sync`, every 10 minutes:
-  - `python -m garmin_drive sync-strava --days 14 --max-pages 5 --enrich missing --publish-raw --recent-mile-days 14 --request-budget 900`
+  - `python -m garmin_drive sync-strava --days 14 --max-pages 5 --enrich missing --publish-raw --skip-maps --recent-mile-days 14 --request-budget 900`
 - `garmin-health-sync`, every 2 hours:
   - `python -m garmin_drive sync-garmin-health --days 14 --state-backend drive`
 
@@ -188,7 +190,15 @@ python -m garmin_drive sync-all --state-backend drive --days 14 --health-days 14
 .\scripts\publish_cached_archive.ps1 -TrashOldIdFiles
 ```
 
-Use `--no-upload` to update local output and hidden state without publishing visible Drive files. Use `--force-upload` to rebuild visible Drive files. Use `--force-refetch` with Garmin range backfills when you want to overwrite raw health days that were already archived.
+Use `--no-upload` to update local output and hidden state without publishing visible Drive files. Use `--force-upload` to rebuild visible Drive files when generated output files are missing or the visible folder layout has changed. Use `--force-refetch` with Garmin range backfills when you want to overwrite raw health days that were already archived.
+
+Use `--skip-maps` on memory-constrained scheduled Strava syncs. It still publishes run history, CSVs, recent mile splits, and per-activity raw archive files, but skips rebuilding the heavyweight aggregate map files: `Maps/*.html`, `Raw Data/All Run Routes.geojson`, and `Raw Data/Heatmaps/All Time Activity Map Data.json`. Rebuild those occasionally from a local machine with `.\scripts\publish_cached_archive.ps1 -TrashOldIdFiles`.
+
+To repair missing visible run-history outputs without republishing every detailed raw archive file:
+
+```powershell
+python -m garmin_drive sync-strava --state-backend drive --days 14 --max-pages 5 --enrich missing --recent-mile-days 14 --request-budget 900 --force-upload --no-publish-raw --skip-maps
+```
 
 ## ChatGPT Setup
 
@@ -200,5 +210,5 @@ Connect Google Drive in ChatGPT settings, then connect both project source folde
 Example prompt:
 
 ```text
-Use my Run History and Health Data folders together. Summarize my last 8 weeks of training, compare activity load against sleep, resting HR, HRV, stress, and Body Battery trends, and call out recovery risks.
+Use my Run History and Health Data folders together. Summarize my last 8 weeks of training, compare activity load against sleep duration, resting heart rate, stress, Body Battery minimum/maximum, respiration, and SpO2 trends, and call out recovery risks.
 ```

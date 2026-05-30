@@ -153,6 +153,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_false",
         help="Skip visible Raw Data archive publishing.",
     )
+    sync.add_argument(
+        "--skip-maps",
+        action="store_true",
+        help="Skip heavyweight aggregate map and route outputs during scheduled syncs.",
+    )
     sync.add_argument("--recent-mile-days", type=int, default=14, help="Days of mile splits to expose in top-level files.")
     sync.add_argument("--request-budget", type=int, default=900, help="Maximum Strava API requests to spend on this run.")
     sync.add_argument(
@@ -198,6 +203,11 @@ def main(argv: list[str] | None = None) -> int:
         dest="publish_raw",
         action="store_false",
         help="Skip visible Strava raw archive publishing.",
+    )
+    sync_all.add_argument(
+        "--skip-maps",
+        action="store_true",
+        help="Skip heavyweight aggregate map and route outputs during the Strava sync.",
     )
     sync_all.add_argument("--recent-mile-days", type=int, default=14, help="Days of mile splits to expose.")
     sync_all.add_argument("--request-budget", type=int, default=900, help="Maximum Strava API requests to spend.")
@@ -367,38 +377,50 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
     raw_manifest = load_raw_manifest(settings, backend=backend, drive=drive)
     should_publish = args.force_upload or sync_state.get("last_published_digest") != current_digest
     should_render_outputs = args.no_upload or should_publish or bool(archives)
+    render_maps = not getattr(args, "skip_maps", False)
 
     generated_files = []
     if should_render_outputs:
-        # Only fetch the (potentially large) existing routes + heatmap state from
-        # Drive when we actually have something to render. On the common "nothing
-        # new" tick this is skipped entirely, avoiding megabytes of download/parse.
-        route_features = build_route_collection(
-            settings, drive, publish_raw=publish_raw and not args.no_upload, archives=archives
-        )
-        heatmap_state = build_heatmap_state_collection(
-            settings,
-            drive,
-            publish_raw=publish_raw and not args.no_upload,
-            archives=archives,
-            rebuild=False,
-        )
+        route_features = None
+        heatmap_state = None
+        if render_maps:
+            # Only fetch the (potentially large) existing routes + heatmap state from
+            # Drive when we actually have something to render. On the common "nothing
+            # new" tick this is skipped entirely, avoiding megabytes of download/parse.
+            route_features = build_route_collection(
+                settings, drive, publish_raw=publish_raw and not args.no_upload, archives=archives
+            )
+            heatmap_state = build_heatmap_state_collection(
+                settings,
+                drive,
+                publish_raw=publish_raw and not args.no_upload,
+                archives=archives,
+                rebuild=False,
+            )
         generated_files = render_corpus(
             merged_runs,
             settings.output_dir,
             markdown_as_google_docs=settings.google_upload_as_google_docs,
             recent_mile_days=args.recent_mile_days,
         )
-        generated_files.extend(
-            render_heatmap_outputs(
-                settings,
-                heatmap_state,
-                recent_days=args.recent_mile_days,
-                include_raw_state=publish_raw or args.no_upload,
+        if render_maps and heatmap_state is not None:
+            generated_files.extend(
+                render_heatmap_outputs(
+                    settings,
+                    heatmap_state,
+                    recent_days=args.recent_mile_days,
+                    include_raw_state=publish_raw or args.no_upload,
+                )
             )
-        )
         if publish_raw:
-            generated_files.extend(render_raw_outputs(settings, archives, route_features))
+            generated_files.extend(
+                render_raw_outputs(
+                    settings,
+                    archives,
+                    route_features,
+                    include_all_routes=render_maps,
+                )
+            )
 
     if merged_runs != existing_runs:
         save_run_history(settings, merged_runs, backend=backend, drive=drive)
@@ -565,6 +587,7 @@ def sync_all_sources(settings: Settings, args: argparse.Namespace) -> int:
         force_upload=args.force_upload,
         enrich=args.enrich,
         publish_raw=args.publish_raw,
+        skip_maps=getattr(args, "skip_maps", False),
         recent_mile_days=args.recent_mile_days,
         request_budget=args.request_budget,
         state_backend=args.state_backend,
@@ -1061,7 +1084,13 @@ def render_heatmap_outputs(
     return generated
 
 
-def render_raw_outputs(settings: Settings, archives: list[dict[str, Any]], route_features: dict[str, Any]) -> list[GeneratedFile]:
+def render_raw_outputs(
+    settings: Settings,
+    archives: list[dict[str, Any]],
+    route_features: dict[str, Any] | None,
+    *,
+    include_all_routes: bool = True,
+) -> list[GeneratedFile]:
     generated: list[GeneratedFile] = []
     seen_paths: set[Path] = set()
 
@@ -1072,18 +1101,19 @@ def render_raw_outputs(settings: Settings, archives: list[dict[str, Any]], route
             seen_paths.add(path)
             generated.append(generated_file_from_path(settings.output_dir, path))
 
-    raw_dir = settings.output_dir / RAW_DATA_DIR
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    generated.append(
-        write_generated(
-            raw_dir / ALL_ROUTES_NAME,
-            json.dumps(route_features, indent=2, sort_keys=True) + "\n",
-            remote_name=ALL_ROUTES_NAME,
-            mime_type="application/geo+json",
-            as_google_doc=False,
-            remote_folder_parts=(RAW_DATA_DIR,),
+    if include_all_routes and route_features is not None:
+        raw_dir = settings.output_dir / RAW_DATA_DIR
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        generated.append(
+            write_generated(
+                raw_dir / ALL_ROUTES_NAME,
+                json.dumps(route_features, indent=2, sort_keys=True) + "\n",
+                remote_name=ALL_ROUTES_NAME,
+                mime_type="application/geo+json",
+                as_google_doc=False,
+                remote_folder_parts=(RAW_DATA_DIR,),
+            )
         )
-    )
     return generated
 
 

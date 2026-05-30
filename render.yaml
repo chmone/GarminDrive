@@ -10,7 +10,7 @@ services:
     plan: starter
     schedule: "3,13,23,33,43,53 * * * *"
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python -m garmin_drive sync-strava --days 14 --max-pages 5 --enrich missing --publish-raw --recent-mile-days 14 --request-budget 900"
+    startCommand: "python -m garmin_drive sync-strava --days 14 --max-pages 5 --enrich missing --publish-raw --skip-maps --recent-mile-days 14 --request-budget 900"
     envVars:
       # Must be "drive" on Render; otherwise the job would read an empty
       # ephemeral local disk and miss the durable appData state.
