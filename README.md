@@ -185,8 +185,10 @@ python -m garmin_drive sync-strava --state-backend drive --days 30 --enrich miss
 python -m garmin_drive sync-garmin-health --state-backend drive --days 14
 python -m garmin_drive backfill-garmin-health --state-backend drive --start-date 2024-01-01 --end-date 2026-05-29
 python -m garmin_drive sync-all --state-backend drive --days 14 --health-days 14
+python -m garmin_drive delete-run 123456789 --state-backend drive
 .\scripts\backfill_full_history.ps1 -Days 3650 -RequestBudget 900
 .\scripts\backfill_garmin_health.ps1 -StartDate 2024-01-01 -EndDate 2026-05-29 -ChunkDays 30
+.\scripts\delete_run.ps1 -ActivityId 123456789
 .\scripts\publish_cached_archive.ps1 -TrashOldIdFiles
 ```
 
@@ -199,6 +201,14 @@ To repair missing visible run-history outputs without republishing every detaile
 ```powershell
 python -m garmin_drive sync-strava --state-backend drive --days 14 --max-pages 5 --enrich missing --recent-mile-days 14 --request-budget 900 --force-upload --no-publish-raw --skip-maps
 ```
+
+To remove one bad activity from history, pass its Strava/source activity ID:
+
+```powershell
+.\scripts\delete_run.ps1 -ActivityId 123456789
+```
+
+`delete-run` removes the matching entry from hidden run history, deletes matching local raw/cache files, moves matching visible Drive raw files to trash when using the Drive backend, prunes raw manifest entries, and regenerates the summary outputs. It also records the activity ID in hidden sync state so future Strava syncs do not re-import it. It is safe to rerun if part of the activity was already removed; missing history or raw pieces are skipped.
 
 ## ChatGPT Setup
 

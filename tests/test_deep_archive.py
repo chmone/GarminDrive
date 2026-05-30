@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import tempfile
@@ -9,7 +10,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from garmin_drive.__main__ import activity_sort_key, has_named_raw_replacement, render_raw_outputs
+from garmin_drive.__main__ import activity_sort_key, delete_run, has_named_raw_replacement, render_raw_outputs
+from garmin_drive.config import Settings
 from garmin_drive.corpus import render_corpus
 from garmin_drive.deep_archive import (
     MILE_METERS,
@@ -22,6 +24,7 @@ from garmin_drive.deep_archive import (
     route_relative_path,
 )
 from garmin_drive.render import is_run
+from garmin_drive.state import load_state
 from garmin_drive.strava import StravaClient, StravaRequestBudgetExceeded, parse_limit_header
 
 
@@ -265,6 +268,80 @@ class DeepArchiveTests(unittest.TestCase):
         self.assertIn("Raw Data/Routes/2026/2026-05-27_run-evening-run_123.geojson", generated_paths)
         self.assertNotIn("Raw Data/All Run Routes.geojson", generated_paths)
         self.assertFalse(aggregate_exists)
+
+    def test_delete_run_tolerates_already_missing_history_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / ".data"
+            output_dir = root / "Run History"
+            current = Settings(
+                data_dir=data_dir,
+                output_dir=output_dir,
+                health_output_dir=root / "Health Data",
+                strava_client_id=None,
+                strava_client_secret=None,
+                strava_scope="activity:read_all",
+                strava_token_json_bootstrap=None,
+                google_client_secret_file=root / "client_secret_google.json",
+                google_token_json=None,
+                google_drive_projects_folder_name="Projects",
+                google_drive_projects_folder_id=None,
+                google_drive_run_folder_name="Run History",
+                google_drive_run_folder_id=None,
+                google_drive_health_folder_name="Health Data",
+                google_drive_health_folder_id=None,
+                google_drive_folder_name="Run History",
+                google_drive_folder_id=None,
+                use_legacy_drive_folder=False,
+                google_upload_as_google_docs=False,
+                state_backend="local",
+                garmin_email=None,
+                garmin_password=None,
+                garmin_health_timezone="America/New_York",
+            )
+            state_file = data_dir / "state.json"
+            raw_run = output_dir / "Raw Data" / "Runs" / "2026" / "2026-05-27_run-fast_123.json"
+            raw_route = output_dir / "Raw Data" / "Routes" / "2026" / "2026-05-27_run-fast_123.geojson"
+            cache_file = data_dir / "raw_archive" / "Runs" / "2026" / "123.json"
+            for path in (raw_run, raw_route, cache_file):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}", encoding="utf-8")
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "run_history": [],
+                        "raw_manifest": {
+                            "schema_version": 1,
+                            "files": {
+                                "Raw Data/Runs/2026/2026-05-27_run-fast_123.json": {},
+                                "Raw Data/Routes/2026/2026-05-27_run-fast_123.geojson": {},
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = delete_run(
+                current,
+                argparse.Namespace(
+                    activity_id="123",
+                    dry_run=False,
+                    no_upload=True,
+                    recent_mile_days=14,
+                    state_backend="local",
+                ),
+            )
+            state = load_state(state_file)
+
+            self.assertEqual(result, 0)
+            self.assertFalse(raw_run.exists())
+            self.assertFalse(raw_route.exists())
+            self.assertFalse(cache_file.exists())
+            self.assertEqual(state["raw_manifest"]["files"], {})
+            self.assertEqual(state["excluded_activity_ids"], ["123"])
+            self.assertTrue((output_dir / "Raw Data" / "Run History Data.json").exists())
 
 
 if __name__ == "__main__":

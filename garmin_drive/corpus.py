@@ -31,7 +31,13 @@ PAST_SUMMARY_DIR = "Past Summary"
 DEFAULT_TOP_LEVEL_YEAR_COUNT = 2
 # Top-level files this app used to publish but no longer generates. They are
 # cleaned up locally and trashed on Drive so the ChatGPT folder stays lean.
-RETIRED_TOP_LEVEL_FILES = ("Run History Data.json", "Recent Mile Splits.json")
+RETIRED_TOP_LEVEL_FILES = (
+    "Run History Data.json",
+    "Recent Mile Splits.json",
+    "Run History Data",
+    "Recent Mile Splits",
+    "Mile Splits Data",
+)
 
 
 @dataclass(frozen=True)

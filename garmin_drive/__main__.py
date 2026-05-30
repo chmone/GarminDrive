@@ -128,6 +128,21 @@ def main(argv: list[str] | None = None) -> int:
         help="Where stored history and raw manifest live. Defaults to env/auto.",
     )
 
+    delete_run_parser = subparsers.add_parser(
+        "delete-run",
+        help="Remove one activity from run history and rebuild visible summary outputs.",
+    )
+    delete_run_parser.add_argument("activity_id", help="Strava/source activity ID to remove from run history.")
+    delete_run_parser.add_argument("--dry-run", action="store_true", help="Print what would be removed without writing.")
+    delete_run_parser.add_argument("--no-upload", action="store_true", help="Update history/local output but skip visible Drive trash/uploads.")
+    delete_run_parser.add_argument("--recent-mile-days", type=int, default=14, help="Days of mile splits to expose in top-level files.")
+    delete_run_parser.add_argument(
+        "--state-backend",
+        choices=["auto", "local", "drive"],
+        default=None,
+        help="Where stored history and raw manifest live. Defaults to env/auto.",
+    )
+
     sync = subparsers.add_parser("sync-strava", help="Fetch included Strava activities and publish the Drive corpus.")
     sync.add_argument("--days", type=int, default=14, help="How many days of Strava history to inspect.")
     sync.add_argument("--max-pages", type=int, default=5, help="Maximum Strava pages to fetch, 200 activities each.")
@@ -234,6 +249,8 @@ def main(argv: list[str] | None = None) -> int:
         return bootstrap_garmin_appdata(settings)
     if args.command == "publish-cache":
         return publish_cache(settings, args)
+    if args.command == "delete-run":
+        return delete_run(settings, args)
     if args.command == "sync-strava":
         return sync_strava(settings, args)
     if args.command == "sync-garmin-health":
@@ -350,6 +367,14 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
     )
     activities = strava.iter_activities(after_epoch=after_epoch, max_pages=args.max_pages)
     existing_history = load_run_history(settings, backend=backend, drive=drive)
+    sync_state = load_sync_state(settings, backend=backend, drive=drive)
+    excluded_ids = sync_state_activity_ids(sync_state, "excluded_activity_ids")
+    if excluded_ids:
+        before_count = len(activities)
+        activities = filter_excluded_activities(activities, excluded_ids)
+        skipped_count = before_count - len(activities)
+        if skipped_count:
+            print(f"Skipped {skipped_count} excluded Strava activit{'y' if skipped_count == 1 else 'ies'}.")
     existing_runs = runs_from_history(existing_history)
     existing_runs_by_id = {
         str(run.get("source_activity_id")): run
@@ -373,7 +398,6 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
 
     merged_runs = merge_run_history(existing_history, fetched_runs)
     current_digest = run_history_digest(merged_runs)
-    sync_state = load_sync_state(settings, backend=backend, drive=drive)
     raw_manifest = load_raw_manifest(settings, backend=backend, drive=drive)
     should_publish = args.force_upload or sync_state.get("last_published_digest") != current_digest
     should_render_outputs = args.no_upload or should_publish or bool(archives)
@@ -607,6 +631,301 @@ def sync_all_sources(settings: Settings, args: argparse.Namespace) -> int:
     except Exception as exc:
         print(f"Garmin health sync failed without interrupting Strava sync: {exc}", file=sys.stderr)
     return strava_result
+
+
+def delete_run(settings: Settings, args: argparse.Namespace) -> int:
+    activity_id = str(args.activity_id).strip()
+    if not activity_id:
+        raise RuntimeError("delete-run requires a non-empty activity ID.")
+
+    backend = resolve_state_backend(args.state_backend or settings.state_backend)
+    drive = drive_client(settings) if backend == "drive" else None
+    existing_history = load_run_history(settings, backend=backend, drive=drive)
+    existing_runs = runs_from_history(existing_history)
+    deleted_runs = [
+        run for run in existing_runs if str(run.get("source_activity_id") or "") == activity_id
+    ]
+
+    remaining_runs = [
+        run for run in existing_runs if str(run.get("source_activity_id") or "") != activity_id
+    ]
+    raw_manifest = load_raw_manifest(settings, backend=backend, drive=drive)
+    raw_paths = raw_relative_paths_for_runs(deleted_runs) | raw_manifest_paths_for_activity(raw_manifest, activity_id)
+    years = years_for_runs(deleted_runs, raw_paths)
+    local_files = local_activity_files(settings, activity_id, raw_paths)
+
+    if deleted_runs:
+        print(f"Found {len(deleted_runs)} run(s) for activity {activity_id}:")
+        for run in deleted_runs:
+            print(f"- {run.get('local_date') or 'unknown-date'} {run.get('name') or 'Untitled Run'}")
+    else:
+        print(f"No run-history entry found for activity {activity_id}; continuing cleanup and summary rebuild.")
+    if raw_paths:
+        print("Known raw paths:")
+        for path in sorted(raw_paths):
+            print(f"- {path}")
+    if local_files:
+        print("Local raw/cache files:")
+        for path in local_files:
+            print(f"- {path}")
+
+    if args.dry_run:
+        print("Dry run only; no history, local, or Drive files were changed.")
+        return 0
+
+    local_removed = remove_local_activity_files(local_files)
+    remove_manifest = backend == "local" or not args.no_upload
+    manifest_removed = (
+        remove_raw_manifest_entries_for_activity(raw_manifest, activity_id, raw_paths)
+        if remove_manifest
+        else 0
+    )
+    drive_trashed = 0
+    uploaded_count = 0
+    trashed_year_doc_count = 0
+    if drive is not None and not args.no_upload:
+        folder = get_run_drive_folder(settings, drive)
+        drive_trashed = trash_drive_activity_raw_files(
+            drive,
+            folder["id"],
+            activity_id,
+            raw_paths,
+            years,
+        )
+
+    save_run_history(settings, remaining_runs, backend=backend, drive=drive)
+    generated_files = render_corpus(
+        remaining_runs,
+        settings.output_dir,
+        markdown_as_google_docs=settings.google_upload_as_google_docs,
+        recent_mile_days=args.recent_mile_days,
+    )
+
+    current_digest = run_history_digest(remaining_runs)
+    if not args.no_upload:
+        if drive is None:
+            drive = drive_client(settings)
+        folder = get_run_drive_folder(settings, drive)
+        uploaded_count = upload_generated_files(
+            settings,
+            drive,
+            generated_files,
+            root_folder=folder,
+            raw_manifest=raw_manifest,
+            force_upload=True,
+        )
+        trashed_year_doc_count = trash_legacy_top_level_year_docs(drive, folder["id"], past_summary_cutoff_year())
+        trash_named_files_in_folder(drive, folder["id"], set(RETIRED_TOP_LEVEL_FILES))
+
+    if remove_manifest:
+        save_raw_manifest(settings, raw_manifest, backend=backend, drive=drive)
+
+    sync_state = load_sync_state(settings, backend=backend, drive=drive)
+    sync_state.update(
+        {
+            "last_delete_run_at": datetime.now(timezone.utc).isoformat(),
+            "last_deleted_activity_id": activity_id,
+            "excluded_activity_ids": sorted({*sync_state_activity_ids(sync_state, "excluded_activity_ids"), activity_id}),
+            "stored_run_count": len(remaining_runs),
+            "current_history_digest": current_digest,
+        }
+    )
+    if not args.no_upload:
+        sync_state["last_published_digest"] = current_digest
+        sync_state["last_published_at"] = datetime.now(timezone.utc).isoformat()
+    save_sync_state(settings, sync_state, backend=backend, drive=drive)
+
+    print(f"Removed {len(deleted_runs)} run(s) from hidden history.")
+    print(f"Removed {local_removed} local raw/cache file(s).")
+    if not args.no_upload:
+        print(f"Moved {drive_trashed} visible Drive raw file(s) to trash.")
+        print(f"Removed {manifest_removed} raw manifest entr{'y' if manifest_removed == 1 else 'ies'}.")
+        print(f"Uploaded or updated {uploaded_count} visible summary file(s).")
+    else:
+        print("Skipped visible Drive file trash/upload because --no-upload was set.")
+    if trashed_year_doc_count:
+        print(f"Moved {trashed_year_doc_count} legacy top-level yearly docs to trash (now in Past Summary).")
+    print(f"Local output: {settings.output_dir}")
+    return 0
+
+
+def raw_relative_paths_for_runs(runs: list[dict[str, Any]]) -> set[str]:
+    paths: set[str] = set()
+    for run in runs:
+        for key in ("raw_data_path", "route_geojson_path"):
+            value = run.get(key)
+            if isinstance(value, str) and value.strip():
+                paths.add(normalize_relative_path(value))
+    return paths
+
+
+def sync_state_activity_ids(sync_state: dict[str, Any], key: str) -> set[str]:
+    values = sync_state.get(key)
+    if not isinstance(values, list):
+        return set()
+    return {str(value) for value in values if str(value).strip()}
+
+
+def filter_excluded_activities(activities: list[dict[str, Any]], excluded_ids: set[str]) -> list[dict[str, Any]]:
+    return [
+        activity
+        for activity in activities
+        if str(activity.get("id") or activity.get("source_activity_id") or "") not in excluded_ids
+    ]
+
+
+def raw_manifest_paths_for_activity(raw_manifest: dict[str, Any], activity_id: str) -> set[str]:
+    files = raw_manifest.get("files", {})
+    if not isinstance(files, dict):
+        return set()
+    return {
+        normalize_relative_path(str(key))
+        for key in files
+        if raw_manifest_key_matches_activity(normalize_relative_path(str(key)), activity_id)
+    }
+
+
+def years_for_runs(runs: list[dict[str, Any]], raw_paths: set[str]) -> set[str]:
+    years: set[str] = set()
+    for run in runs:
+        for key in ("local_date", "start_date_local", "start_date"):
+            value = str(run.get(key) or "")
+            if len(value) >= 4 and value[:4].isdigit():
+                years.add(value[:4])
+    for path in raw_paths:
+        parts = relative_path_parts(path)
+        for folder_name in (RAW_RUNS_DIR, RAW_ROUTES_DIR):
+            if folder_name in parts:
+                index = parts.index(folder_name)
+                if len(parts) > index + 1:
+                    years.add(parts[index + 1])
+    return years
+
+
+def local_activity_files(settings: Settings, activity_id: str, raw_paths: set[str]) -> list[Path]:
+    candidates: set[Path] = set()
+    for raw_path in raw_paths:
+        candidates.add(settings.output_dir.joinpath(*relative_path_parts(raw_path)))
+
+    cache_root = settings.data_dir / "raw_archive" / RAW_RUNS_DIR
+    output_roots = [
+        settings.output_dir / RAW_DATA_DIR / RAW_RUNS_DIR,
+        settings.output_dir / RAW_DATA_DIR / RAW_ROUTES_DIR,
+        cache_root,
+    ]
+    for root in output_roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if path.is_file() and raw_file_name_matches_activity(path.name, activity_id):
+                candidates.add(path)
+    return sorted(path for path in candidates if path.exists())
+
+
+def remove_local_activity_files(paths: list[Path]) -> int:
+    removed = 0
+    for path in paths:
+        if not path.exists():
+            continue
+        path.unlink()
+        removed += 1
+    return removed
+
+
+def remove_raw_manifest_entries_for_activity(
+    raw_manifest: dict[str, Any],
+    activity_id: str,
+    raw_paths: set[str],
+) -> int:
+    files = raw_manifest.setdefault("files", {})
+    if not isinstance(files, dict):
+        raw_manifest["files"] = {}
+        return 0
+    removed = 0
+    normalized_paths = {normalize_relative_path(path) for path in raw_paths}
+    for key in list(files.keys()):
+        normalized_key = normalize_relative_path(str(key))
+        if normalized_key in normalized_paths or raw_manifest_key_matches_activity(normalized_key, activity_id):
+            files.pop(key, None)
+            removed += 1
+    return removed
+
+
+def trash_drive_activity_raw_files(
+    drive: DriveClient,
+    root_folder_id: str,
+    activity_id: str,
+    raw_paths: set[str],
+    years: set[str],
+) -> int:
+    trashed_ids: set[str] = set()
+    trashed = 0
+    for raw_path in raw_paths:
+        for item in drive_files_for_relative_path(drive, root_folder_id, raw_path):
+            file_id = str(item.get("id") or "")
+            if file_id and file_id not in trashed_ids:
+                drive.trash_file(file_id)
+                trashed_ids.add(file_id)
+                trashed += 1
+
+    for folder_name in (RAW_RUNS_DIR, RAW_ROUTES_DIR):
+        parent = drive.find_folder_path(root_folder_id, (RAW_DATA_DIR, folder_name))
+        if not parent:
+            continue
+        year_folders = [
+            item
+            for item in drive.list_files_in_folder(parent["id"])
+            if item.get("mimeType") == "application/vnd.google-apps.folder"
+            and (not years or str(item.get("name") or "") in years)
+        ]
+        for year_folder in year_folders:
+            for item in drive.list_files_in_folder(year_folder["id"]):
+                if not raw_file_name_matches_activity(str(item.get("name") or ""), activity_id):
+                    continue
+                file_id = str(item.get("id") or "")
+                if file_id and file_id not in trashed_ids:
+                    drive.trash_file(file_id)
+                    trashed_ids.add(file_id)
+                    trashed += 1
+    return trashed
+
+
+def drive_files_for_relative_path(
+    drive: DriveClient,
+    root_folder_id: str,
+    relative_path: str,
+) -> list[dict[str, Any]]:
+    parts = relative_path_parts(relative_path)
+    if not parts:
+        return []
+    folder = drive.find_folder_path(root_folder_id, tuple(parts[:-1]))
+    if not folder:
+        return []
+    name = parts[-1]
+    return [item for item in drive.list_files_in_folder(folder["id"]) if str(item.get("name") or "") == name]
+
+
+def raw_manifest_key_matches_activity(key: str, activity_id: str) -> bool:
+    parts = relative_path_parts(key)
+    if len(parts) < 4 or parts[0] != RAW_DATA_DIR:
+        return False
+    if parts[1] not in {RAW_RUNS_DIR, RAW_ROUTES_DIR}:
+        return False
+    return raw_file_name_matches_activity(parts[-1], activity_id)
+
+
+def raw_file_name_matches_activity(name: str, activity_id: str) -> bool:
+    return name in {f"{activity_id}.json", f"{activity_id}.geojson"} or name.endswith(
+        f"_{activity_id}.json"
+    ) or name.endswith(f"_{activity_id}.geojson")
+
+
+def normalize_relative_path(value: str) -> str:
+    return "/".join(relative_path_parts(value))
+
+
+def relative_path_parts(value: str) -> tuple[str, ...]:
+    return tuple(part for part in re.split(r"[\\/]+", str(value).strip()) if part and part != ".")
 
 
 def publish_cache(settings: Settings, args: argparse.Namespace) -> int:
