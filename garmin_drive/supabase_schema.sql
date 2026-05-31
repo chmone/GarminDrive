@@ -5,9 +5,10 @@
 -- every table keeps the full normalized row in a `raw` jsonb column so new/rare source fields never
 -- require a migration. Idempotent: re-applying is a no-op.
 --
--- RLS is intentionally NOT enabled yet (single trusted writer + the app's trusted-header user seam).
--- When real auth lands, enable RLS and add per-user policies; the cron writer should use a role that
--- bypasses RLS (service_role or a dedicated owner).
+-- RLS is ENABLED (not forced) on every table at the END of this file: deny-by-default for the public
+-- anon/authenticated API, while the table owner (the GarminDrive sink) and service_role bypass
+-- non-forced RLS and keep working. Per-user policies + auth are added by the app when real auth lands
+-- (then optionally FORCE RLS). The cron writer/app reader must use the owner or service_role role.
 
 create table if not exists health (
   user_id text not null,
@@ -136,3 +137,20 @@ create table if not exists run_streams (
 
 create index if not exists health_user_date_idx on health (user_id, date);
 create index if not exists runs_user_local_date_idx on runs (user_id, local_date);
+
+-- --- Row Level Security ---------------------------------------------------------------------------
+-- ENABLE (not FORCE) on every table. With no policies this denies the public anon/authenticated API
+-- entirely (zero rows), while the table owner (the sink writer) and service_role bypass non-forced
+-- RLS — so ingestion and the app's server-side reads keep working. When auth lands, add per-user
+-- policies (e.g. `using (user_id = auth.uid()::text)`) and, if app clients ever connect as the owner,
+-- FORCE rls. Idempotent: re-running ALTER ... ENABLE on an already-enabled table is a no-op.
+alter table health          enable row level security;
+alter table runs            enable row level security;
+alter table splits          enable row level security;
+alter table routes          enable row level security;
+alter table ingest_meta     enable row level security;
+alter table health_raw      enable row level security;
+alter table health_intraday enable row level security;
+alter table current_status  enable row level security;
+alter table run_details     enable row level security;
+alter table run_streams     enable row level security;
