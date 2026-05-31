@@ -518,6 +518,34 @@ def sync_health(settings: Settings, days: list[dict], raw_archives: list[dict] |
         log.warning("SQL sink (health) failed; Drive output is unaffected. (%s)", exc)
 
 
+SINK_TABLES = [
+    "health", "health_raw", "health_intraday", "current_status",
+    "runs", "run_details", "run_streams", "splits", "routes",
+]
+
+
+def table_counts(settings: Settings) -> dict[str, int]:
+    """Best-effort row counts per sink table for the calling user (for backfill verification)."""
+    psycopg, _ = _psycopg()
+    if psycopg is None or not settings.sql_sink_enabled:
+        return {}
+    uid = settings.bodycompass_user_id
+    counts: dict[str, int] = {}
+    try:
+        with psycopg.connect(settings.database_url) as conn:
+            with conn.cursor() as cur:
+                for table in SINK_TABLES:
+                    try:
+                        cur.execute(f'SELECT count(*) FROM "{table}" WHERE user_id = %s', (uid,))
+                        row = cur.fetchone()
+                        counts[table] = int(row[0]) if row else 0
+                    except Exception:  # noqa: BLE001 — table may not exist yet
+                        conn.rollback()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("SQL sink: could not read table counts. (%s)", exc)
+    return counts
+
+
 def _write_meta(cur, user_id: str, source: str, row_count: int) -> None:
     cur.execute(
         'INSERT INTO ingest_meta (user_id, source, last_ingested_at, row_count) '

@@ -109,6 +109,15 @@ class DriveClient:
             _, done = downloader.next_chunk()
         return buffer.getvalue().decode("utf-8")
 
+    def get_text_by_id(self, file_id: str) -> str:
+        request = self.service.files().get_media(fileId=file_id)
+        buffer = io.BytesIO()
+        downloader = MediaIoBaseDownload(buffer, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        return buffer.getvalue().decode("utf-8")
+
     def find_folder_path(self, root_folder_id: str, folder_parts: tuple[str, ...]) -> dict[str, Any] | None:
         current = {"id": root_folder_id}
         for folder_name in folder_parts:
