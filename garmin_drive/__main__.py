@@ -213,7 +213,8 @@ def main(argv: list[str] | None = None) -> int:
     backfill_sql_parser = subparsers.add_parser(
         "backfill-sql",
         help="One-time: mirror the full raw run + health history already in Drive into Postgres "
-             "(no Strava/Garmin re-fetch). Populates run_details/run_streams/health_raw/health_intraday.",
+             "(no Strava/Garmin re-fetch). Populates run_details/run_streams/health_raw/"
+             "health_intraday and fetches per-run weather (Open-Meteo).",
     )
     backfill_sql_parser.add_argument("--skip-runs", action="store_true", help="Backfill health only.")
     backfill_sql_parser.add_argument("--skip-health", action="store_true", help="Backfill runs only.")
@@ -1210,7 +1211,7 @@ def backfill_sql(settings: Settings, args: argparse.Namespace) -> int:
                 route_features if index == 0 else None,
                 archives=batch,
             )
-        print("  -> runs / splits / routes / run_details / run_streams upserted.")
+        print("  -> runs / splits / routes / run_details / run_streams / weather upserted.")
 
     if not args.skip_health:
         days = health_days_from_history(load_health_history(settings, backend="drive", drive=drive))

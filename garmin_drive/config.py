@@ -67,6 +67,7 @@ class Settings:
     store_run_streams: bool = True        # mirror full per-sample run streams (large); off = summaries + details only
     intraday_enabled: bool = True         # store intraday time-series + the "now" snapshot from fetched health days
     intraday_days: int = 1                # how many trailing days the lightweight sync-garmin-intraday refreshes
+    weather_enabled: bool = True          # fetch per-run weather (Open-Meteo archive) into the weather table
 
     @property
     def sql_sink_enabled(self) -> bool:
@@ -143,6 +144,7 @@ def get_settings() -> Settings:
         store_run_streams=env_bool("BODYCOMPASS_STORE_RUN_STREAMS", True),
         intraday_enabled=env_bool("BODYCOMPASS_INTRADAY", True),
         intraday_days=max(1, int(os.getenv("BODYCOMPASS_INTRADAY_DAYS", "1") or 1)),
+        weather_enabled=env_bool("BODYCOMPASS_WEATHER", True),
     )
 
 
