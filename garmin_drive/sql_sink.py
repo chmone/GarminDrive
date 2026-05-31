@@ -78,6 +78,16 @@ ROUTE_COLUMNS = [
     "distance_miles", "start_date", "start_date_local", "start_lat", "start_lon",
 ]
 
+# Per-run weather (Open-Meteo archive). All values metric: °C, % RH, km/h. The full fetch dict
+# (incl. selection metadata) also lands in `raw` jsonb.
+WEATHER_COLUMNS: list[tuple[str, str]] = [
+    ("source_activity_id", "source_activity_id"), ("local_date", "local_date"),
+    ("temperature_c", "temperature_c"), ("apparent_temperature_c", "apparent_temperature_c"),
+    ("relative_humidity_pct", "relative_humidity_pct"), ("dew_point_c", "dew_point_c"),
+    ("wind_speed_kmh", "wind_speed_kmh"), ("weather_source", "weather_source"),
+    ("fetched_at", "fetched_at"),
+]
+
 SCHEMA_SQL = """
 create table if not exists health (
   user_id text not null,
@@ -138,6 +148,20 @@ create table if not exists ingest_meta (
   user_id text not null, source text not null,
   last_ingested_at timestamptz default now(), row_count integer,
   primary key (user_id, source)
+);
+create table if not exists weather (
+  user_id text not null,
+  source_activity_id text not null,
+  local_date date,
+  temperature_c double precision,
+  apparent_temperature_c double precision,
+  relative_humidity_pct double precision,
+  dew_point_c double precision,
+  wind_speed_kmh double precision,
+  weather_source text,
+  fetched_at timestamptz default now(),
+  raw jsonb,
+  primary key (user_id, source_activity_id)
 );
 
 -- --- richer raw + intraday fidelity (all additive; existing tables/reads are untouched) ---
@@ -200,6 +224,7 @@ create table if not exists run_streams (
 
 create index if not exists health_user_date_idx on health (user_id, date);
 create index if not exists runs_user_local_date_idx on runs (user_id, local_date);
+create index if not exists weather_user_local_date_idx on weather (user_id, local_date);
 """
 
 
@@ -410,6 +435,81 @@ def _run_stream_params(archives: Iterable[dict], user_id: str, Jsonb) -> list[tu
     return out
 
 
+def _weather_params(rows: Iterable[dict], user_id: str, Jsonb) -> list[tuple]:
+    out = []
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("source_activity_id"):
+            continue
+        vals = [user_id] + [_norm(row.get(key)) for _, key in WEATHER_COLUMNS] + [Jsonb(row)]
+        out.append(tuple(vals))
+    return out
+
+
+# Indoor / virtual runs have no real outdoor weather — skip them (don't invent values).
+_INDOOR_SPORT_MARKERS = ("virtual", "treadmill", "indoor")
+
+
+def _is_outdoor(run: dict) -> bool:
+    sport = str(run.get("sport_type") or "").lower()
+    return not any(marker in sport for marker in _INDOOR_SPORT_MARKERS)
+
+
+def _start_coords_by_activity(route_features: dict | None,
+                              archives: Iterable[dict] | None) -> dict[str, tuple[float, float]]:
+    """Map source_activity_id -> (lat, lon) from the route geometry's first coordinate ([lon, lat]).
+
+    Routes are read from the heatmap route FeatureCollection when present, and also from each raw
+    archive's ``route`` feature — so a new-ingest tick that skipped map rendering still has coords for
+    the freshly enriched runs.
+    """
+    coords: dict[str, tuple[float, float]] = {}
+
+    def _add(feat: Any) -> None:
+        if not isinstance(feat, dict):
+            return
+        props = feat.get("properties") or {}
+        geom = feat.get("geometry") or {}
+        aid = props.get("source_activity_id") or feat.get("id")
+        line = geom.get("coordinates") or []
+        if aid and line and isinstance(line[0], (list, tuple)) and len(line[0]) >= 2:
+            coords.setdefault(str(aid), (line[0][1], line[0][0]))  # (lat, lon) from [lon, lat]
+
+    if route_features and isinstance(route_features.get("features"), list):
+        for feat in route_features["features"]:
+            _add(feat)
+    for archive in archives or []:
+        if isinstance(archive, dict):
+            _add(archive.get("route"))
+    return coords
+
+
+def _weather_candidates(runs: Iterable[dict],
+                        coords: dict[str, tuple[float, float]]) -> list[dict]:
+    """Outdoor runs that have a route start point — the runs we can look up weather for."""
+    out, seen = [], set()
+    for run in runs or []:
+        if not isinstance(run, dict):
+            continue
+        aid = run.get("source_activity_id")
+        if not aid:
+            continue
+        aid = str(aid)
+        if aid in seen or aid not in coords or not _is_outdoor(run):
+            continue
+        start = run.get("start_date_local")
+        local_date = run.get("local_date") or (str(start)[:10] if isinstance(start, str) and len(start) >= 10 else None)
+        if not local_date:
+            continue
+        lat, lon = coords[aid]
+        seen.add(aid)
+        out.append({
+            "source_activity_id": aid, "lat": lat, "lon": lon,
+            "local_date": str(local_date), "start_date_local": start,
+            "timezone": run.get("timezone"),
+        })
+    return out
+
+
 # --- public API --------------------------------------------------------------
 
 def sync_runs(settings: Settings, runs: list[dict], route_features: dict | None = None,
@@ -461,6 +561,10 @@ def sync_runs(settings: Settings, runs: list[dict], route_features: dict | None 
                  n_runs, n_splits, n_routes, n_details, n_streams, uid)
     except Exception as exc:  # noqa: BLE001 — never let the sink break the Drive publish
         log.warning("SQL sink (runs) failed; Drive output is unaffected. (%s)", exc)
+
+    # Per-run weather (Open-Meteo), additive + best-effort, in its own connection/txn so a weather or
+    # network failure never touches the runs upsert above.
+    sync_weather(settings, runs, route_features, archives)
 
 
 def sync_health(settings: Settings, days: list[dict], raw_archives: list[dict] | None = None) -> None:
@@ -518,9 +622,73 @@ def sync_health(settings: Settings, days: list[dict], raw_archives: list[dict] |
         log.warning("SQL sink (health) failed; Drive output is unaffected. (%s)", exc)
 
 
+def sync_weather(settings: Settings, runs: list[dict], route_features: dict | None = None,
+                 archives: list[dict] | None = None) -> None:
+    """Fetch + upsert per-run weather for outdoor runs that have a route start point.
+
+    Skips indoor/treadmill/virtual runs and runs without start coords (leaves weather absent), and
+    skips runs that already have a weather row — so a steady-state cron only hits Open-Meteo for new
+    runs, while the first run / ``backfill-sql`` populates the whole history. Records an
+    ``ingest_meta`` row (source='weather'). Best-effort: any failure is logged and swallowed.
+    """
+    if not settings.sql_sink_enabled or not getattr(settings, "weather_enabled", True):
+        return
+    psycopg, Jsonb = _psycopg()
+    if psycopg is None:
+        return
+    uid = settings.bodycompass_user_id
+    coords = _start_coords_by_activity(route_features, archives)
+    candidates = _weather_candidates(runs, coords)
+    if not candidates:
+        return
+    try:
+        from . import weather as weather_mod  # noqa: PLC0415 — lazy so requests stays optional here
+
+        # 1. Skip runs already stored (idempotent + respects Open-Meteo rate limits during backfill).
+        existing: set[str] = set()
+        with psycopg.connect(settings.database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(SCHEMA_SQL)
+                cur.execute('SELECT source_activity_id FROM weather WHERE user_id = %s', (uid,))
+                existing = {str(row[0]) for row in cur.fetchall()}
+        pending = [c for c in candidates if c["source_activity_id"] not in existing]
+        if not pending:
+            return
+
+        # 2. Fetch (network; cached by lat/lon/date inside the weather module).
+        rows: list[dict] = []
+        for cand in pending:
+            data = weather_mod.fetch_run_weather(
+                cand["lat"], cand["lon"], cand["local_date"],
+                start_date_local=cand.get("start_date_local"), tz=cand.get("timezone"),
+            )
+            if data:
+                data["source_activity_id"] = cand["source_activity_id"]
+                data["local_date"] = cand["local_date"]
+                rows.append(data)
+        if not rows:
+            return
+
+        # 3. Upsert + record ingest_meta (row_count = total weather rows for the user).
+        with psycopg.connect(settings.database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(SCHEMA_SQL)
+                n = _upsert(cur, Jsonb, "weather",
+                            ["user_id"] + [c for c, _ in WEATHER_COLUMNS] + ["raw"],
+                            ["user_id", "source_activity_id"],
+                            _weather_params(rows, uid, Jsonb))
+                cur.execute('SELECT count(*) FROM weather WHERE user_id = %s', (uid,))
+                total_row = cur.fetchone()
+                _write_meta(cur, uid, "weather", int(total_row[0]) if total_row else n)
+            conn.commit()
+        log.info("SQL sink: upserted %s weather rows (user=%s).", n, uid)
+    except Exception as exc:  # noqa: BLE001 — never let the sink break the Drive publish
+        log.warning("SQL sink (weather) failed; Drive output is unaffected. (%s)", exc)
+
+
 SINK_TABLES = [
     "health", "health_raw", "health_intraday", "current_status",
-    "runs", "run_details", "run_streams", "splits", "routes",
+    "runs", "run_details", "run_streams", "splits", "routes", "weather",
 ]
 
 

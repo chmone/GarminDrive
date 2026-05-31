@@ -190,10 +190,18 @@ BODYCOMPASS_SQL_SINK=true
 
 Use the Supabase **Session pooler** URI on IPv4-only networks / Render (the direct `db.<ref>` host is
 IPv6-only). The sink self-creates its schema (`create table if not exists`); the same DDL is in
-`garmin_drive/supabase_schema.sql` to apply/review in the Supabase SQL editor. It writes five tables
-keyed by `user_id` — `runs`, `splits`, `routes`, `health`, `ingest_meta` — each with a `raw` jsonb
-column, upserted by primary key (idempotent). Because `sync-strava` / `sync-garmin-health` already hold
-the full merged history in memory, a single sink-enabled sync populates the whole dataset.
+`garmin_drive/supabase_schema.sql` to apply/review in the Supabase SQL editor. It writes tables
+keyed by `user_id` — `runs`, `splits`, `routes`, `health`, `weather`, `ingest_meta` (plus the richer
+`run_details`, `run_streams`, `health_raw`, `health_intraday`, `current_status` tables) — each with a
+`raw` jsonb column, upserted by primary key (idempotent). Because `sync-strava` / `sync-garmin-health`
+already hold the full merged history in memory, a single sink-enabled sync populates the whole dataset.
+
+Per-run **weather** is fetched from the free, key-less [Open-Meteo archive API](https://open-meteo.com/)
+for each outdoor run at its route start point and date — the hourly value nearest the run's start time
+(metric: temperature/apparent/dew point in °C, humidity %, wind km/h), used to de-confound heat effects
+on HR/pace. Indoor/treadmill/virtual runs and runs without a route start point are left absent. It runs
+on each ingest (and during `backfill-sql`), only hitting the API for runs not already stored, and records
+an `ingest_meta` row (`source='weather'`). Set `BODYCOMPASS_WEATHER=false` to disable.
 
 ```powershell
 # Populate / refresh SQL without re-publishing Drive files (reads stored history from appData):
@@ -202,7 +210,11 @@ python -m garmin_drive sync-garmin-health --state-backend drive --days 1 --no-up
 ```
 
 On Render, add `DATABASE_URL` (+ `BODYCOMPASS_USER_ID`) as secrets on the existing cron services; the
-normal scheduled syncs then keep Postgres current. Routes refresh on non-`--skip-maps` runs.
+normal scheduled syncs then keep Postgres current. Routes refresh on non-`--skip-maps` runs. Per-run
+weather needs no extra config — it's on by default once the sink is enabled (Open-Meteo is key-less);
+the cron just needs outbound HTTPS to `archive-api.open-meteo.com`. To backfill weather for existing
+history in one shot, run `python -m garmin_drive backfill-sql` (it upserts weather alongside the other
+tables).
 
 ## Local Commands
 

@@ -70,9 +70,28 @@ create table if not exists routes (
 );
 
 create table if not exists ingest_meta (
-  user_id text not null, source text not null,   -- 'strava' | 'garmin_health'
+  user_id text not null, source text not null,   -- 'strava' | 'garmin_health' | 'weather'
   last_ingested_at timestamptz default now(), row_count integer,
   primary key (user_id, source)
+);
+
+-- Per-run weather at the route start point + run date (Open-Meteo archive API). Used to de-confound
+-- heat effects on HR/pace. One row per outdoor run; indoor/treadmill/virtual runs and runs without a
+-- route start point are left absent. All values metric: temperature/dew point/apparent in °C,
+-- relative humidity in %, wind speed in km/h. Keyed by (user_id, source_activity_id), joins to runs.
+create table if not exists weather (
+  user_id text not null,
+  source_activity_id text not null,
+  local_date date,
+  temperature_c double precision,
+  apparent_temperature_c double precision,
+  relative_humidity_pct double precision,
+  dew_point_c double precision,
+  wind_speed_kmh double precision,
+  weather_source text,                 -- e.g. 'open-meteo-archive'
+  fetched_at timestamptz default now(),
+  raw jsonb,
+  primary key (user_id, source_activity_id)
 );
 
 -- --- richer raw + intraday fidelity -------------------------------------------------------------
@@ -137,6 +156,7 @@ create table if not exists run_streams (
 
 create index if not exists health_user_date_idx on health (user_id, date);
 create index if not exists runs_user_local_date_idx on runs (user_id, local_date);
+create index if not exists weather_user_local_date_idx on weather (user_id, local_date);
 
 -- --- Row Level Security ---------------------------------------------------------------------------
 -- ENABLE (not FORCE) on every table. With no policies this denies the public anon/authenticated API
@@ -149,6 +169,7 @@ alter table runs            enable row level security;
 alter table splits          enable row level security;
 alter table routes          enable row level security;
 alter table ingest_meta     enable row level security;
+alter table weather         enable row level security;
 alter table health_raw      enable row level security;
 alter table health_intraday enable row level security;
 alter table current_status  enable row level security;
