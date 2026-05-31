@@ -37,6 +37,12 @@ services:
         sync: false
       - key: GOOGLE_TOKEN_JSON
         sync: false
+      # Body Compass Supabase sink. Use the Supabase SESSION POOLER URI (Render is IPv4-only; the
+      # direct db.<ref> host is IPv6-only). Leave unset to disable the sink (Drive output unaffected).
+      - key: DATABASE_URL
+        sync: false
+      - key: BODYCOMPASS_USER_ID
+        value: default
 
   - type: cron
     name: garmin-health-sync
@@ -64,3 +70,8 @@ services:
       # Secrets: enter these in the Render dashboard, never commit them.
       - key: GOOGLE_TOKEN_JSON
         sync: false
+      # Body Compass Supabase sink (session pooler URI; see the Strava cron note above).
+      - key: DATABASE_URL
+        sync: false
+      - key: BODYCOMPASS_USER_ID
+        value: default

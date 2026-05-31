@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from . import sql_sink
 from .config import Settings, ensure_local_dirs, get_settings
 from .corpus import (
     RETIRED_TOP_LEVEL_FILES,
@@ -491,6 +492,12 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
     )
     save_sync_state(settings, sync_state, backend=backend, drive=drive)
 
+    # Additive Body Compass sink: mirror the merged history into Postgres (best-effort; never blocks
+    # the Drive publish). Skipped on a no-op tick. `route_features` is present only when maps were
+    # rendered (not on --skip-maps crons), so routes refresh on full/publish-cache runs.
+    if settings.sql_sink_enabled and (merged_runs != existing_runs or args.force_upload):
+        sql_sink.sync_runs(settings, merged_runs, route_features if should_render_outputs else None)
+
     if trashed_map_count:
         print(f"Moved {trashed_map_count} legacy route-only map HTML files to trash.")
     if trashed_year_doc_count:
@@ -585,6 +592,10 @@ def sync_garmin_health(settings: Settings, args: argparse.Namespace) -> int:
         }
     )
     save_health_sync_state(settings, sync_state, backend=backend, drive=drive)
+
+    # Additive Body Compass sink (best-effort; never blocks the Drive publish).
+    if settings.sql_sink_enabled and (fetched_days or merged_days != existing_days or args.force_upload):
+        sql_sink.sync_health(settings, merged_days)
 
     print(f"Fetched Garmin health data for {len(raw_archives)} days; skipped {len(skipped_dates)} archived days.")
     if not args.no_upload:

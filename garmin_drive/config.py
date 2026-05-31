@@ -58,6 +58,17 @@ class Settings:
     garmin_email: str | None
     garmin_password: str | None
     garmin_health_timezone: str
+    # --- Body Compass Supabase sink (additive; the Drive publish path is unaffected) ---
+    # Defaulted so existing callers/tests that build Settings without these keep working; the sink is
+    # off until database_url is set.
+    database_url: str | None = None   # Postgres/Supabase connection string (session pooler URI)
+    bodycompass_user_id: str = "default"  # tag every synced row with this user id (app's DEFAULT_USER_ID)
+    bodycompass_sql_sink: bool = True     # master switch; the sink also needs database_url to be set
+
+    @property
+    def sql_sink_enabled(self) -> bool:
+        """Mirror this sync into Postgres only when explicitly on AND a connection string exists."""
+        return bool(self.bodycompass_sql_sink and self.database_url)
 
     @property
     def token_dir(self) -> Path:
@@ -123,6 +134,9 @@ def get_settings() -> Settings:
         garmin_email=os.getenv("GARMIN_EMAIL") or None,
         garmin_password=os.getenv("GARMIN_PASSWORD") or None,
         garmin_health_timezone=os.getenv("GARMIN_HEALTH_TIMEZONE", "America/New_York"),
+        database_url=os.getenv("DATABASE_URL") or None,
+        bodycompass_user_id=os.getenv("BODYCOMPASS_USER_ID", "default"),
+        bodycompass_sql_sink=env_bool("BODYCOMPASS_SQL_SINK", True),
     )
 
 

@@ -173,6 +173,37 @@ Set these Render secrets:
 
 Garmin credentials are not required on Render after `bootstrap-garmin-appdata` succeeds. The Garmin cron reads `garmin_token.json` from Drive appData and writes refreshed tokens back there.
 
+## Body Compass Supabase sink (optional)
+
+Alongside the Google Drive output, a sync can mirror its normalized rows into a Postgres/Supabase
+database so the **Body Compass** app reads durable, query-ready data instead of parsing Drive files.
+It is **additive** — the Drive publishing path is unchanged — and **best-effort**: a DB failure logs a
+warning and never blocks a Drive sync.
+
+Enable it by setting `DATABASE_URL` (and optionally `BODYCOMPASS_USER_ID`, default `default`):
+
+```dotenv
+DATABASE_URL=postgresql://postgres:<url-encoded-password>@<host>:5432/postgres
+BODYCOMPASS_USER_ID=default
+BODYCOMPASS_SQL_SINK=true
+```
+
+Use the Supabase **Session pooler** URI on IPv4-only networks / Render (the direct `db.<ref>` host is
+IPv6-only). The sink self-creates its schema (`create table if not exists`); the same DDL is in
+`garmin_drive/supabase_schema.sql` to apply/review in the Supabase SQL editor. It writes five tables
+keyed by `user_id` — `runs`, `splits`, `routes`, `health`, `ingest_meta` — each with a `raw` jsonb
+column, upserted by primary key (idempotent). Because `sync-strava` / `sync-garmin-health` already hold
+the full merged history in memory, a single sink-enabled sync populates the whole dataset.
+
+```powershell
+# Populate / refresh SQL without re-publishing Drive files (reads stored history from appData):
+python -m garmin_drive sync-strava --state-backend drive --days 1 --no-upload --force-upload
+python -m garmin_drive sync-garmin-health --state-backend drive --days 1 --no-upload --force-upload
+```
+
+On Render, add `DATABASE_URL` (+ `BODYCOMPASS_USER_ID`) as secrets on the existing cron services; the
+normal scheduled syncs then keep Postgres current. Routes refresh on non-`--skip-maps` runs.
+
 ## Local Commands
 
 ```powershell
