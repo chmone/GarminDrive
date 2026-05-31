@@ -195,6 +195,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     add_health_sync_args(health_backfill)
 
+    health_intraday = subparsers.add_parser(
+        "sync-garmin-intraday",
+        help="Lightweight refresh of today's intraday health + the 'now' snapshot into the SQL sink "
+        "(no Drive corpus rebuild). Run frequently for an up-to-date dashboard.",
+    )
+    health_intraday.add_argument(
+        "--days", type=int, default=None,
+        help="Trailing days to refresh (default: BODYCOMPASS_INTRADAY_DAYS, usually 1 = today only).",
+    )
+    health_intraday.add_argument(
+        "--state-backend", choices=["auto", "local", "drive"], default=None,
+        help="Where the Garmin token lives. Defaults to env/auto.",
+    )
+
     sync_all = subparsers.add_parser("sync-all", help="Run Strava activity sync and Garmin health sync.")
     sync_all.add_argument("--days", type=int, default=14, help="How many days of Strava history to inspect.")
     sync_all.add_argument("--health-days", type=int, default=14, help="How many recent Garmin health days to fetch.")
@@ -258,6 +272,8 @@ def main(argv: list[str] | None = None) -> int:
         return sync_garmin_health(settings, args)
     if args.command == "backfill-garmin-health":
         return backfill_garmin_health(settings, args)
+    if args.command == "sync-garmin-intraday":
+        return sync_garmin_intraday(settings, args)
     if args.command == "sync-all":
         return sync_all_sources(settings, args)
 
@@ -495,8 +511,13 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
     # Additive Body Compass sink: mirror the merged history into Postgres (best-effort; never blocks
     # the Drive publish). Skipped on a no-op tick. `route_features` is present only when maps were
     # rendered (not on --skip-maps crons), so routes refresh on full/publish-cache runs.
-    if settings.sql_sink_enabled and (merged_runs != existing_runs or args.force_upload):
-        sql_sink.sync_runs(settings, merged_runs, route_features if should_render_outputs else None)
+    if settings.sql_sink_enabled and (merged_runs != existing_runs or args.force_upload or archives):
+        sql_sink.sync_runs(
+            settings,
+            merged_runs,
+            route_features if should_render_outputs else None,
+            archives=archives,
+        )
 
     if trashed_map_count:
         print(f"Moved {trashed_map_count} legacy route-only map HTML files to trash.")
@@ -593,9 +614,10 @@ def sync_garmin_health(settings: Settings, args: argparse.Namespace) -> int:
     )
     save_health_sync_state(settings, sync_state, backend=backend, drive=drive)
 
-    # Additive Body Compass sink (best-effort; never blocks the Drive publish).
+    # Additive Body Compass sink (best-effort; never blocks the Drive publish). The freshly-fetched
+    # raw_archives carry the full payloads + intraday series + the "now" snapshot for today.
     if settings.sql_sink_enabled and (fetched_days or merged_days != existing_days or args.force_upload):
-        sql_sink.sync_health(settings, merged_days)
+        sql_sink.sync_health(settings, merged_days, raw_archives=raw_archives)
 
     print(f"Fetched Garmin health data for {len(raw_archives)} days; skipped {len(skipped_dates)} archived days.")
     if not args.no_upload:
@@ -611,6 +633,35 @@ def backfill_garmin_health(settings: Settings, args: argparse.Namespace) -> int:
     if not args.end_date:
         args.end_date = health_today(settings).isoformat()
     return sync_garmin_health(settings, args)
+
+
+def sync_garmin_intraday(settings: Settings, args: argparse.Namespace) -> int:
+    """Refresh the most up-to-date health Garmin has for today (and a small trailing window) and
+    mirror it into the SQL sink only — intraday series + the per-user "now" snapshot. Deliberately
+    skips the Drive corpus rebuild so it's cheap enough to run on a frequent cron."""
+    if not settings.intraday_enabled:
+        print("Intraday sync is disabled (BODYCOMPASS_INTRADAY=0); nothing to do.")
+        return 0
+    if not settings.sql_sink_enabled:
+        print("SQL sink is disabled (set DATABASE_URL); intraday data has nowhere to go. Skipping.")
+        return 0
+
+    backend = resolve_state_backend(args.state_backend or settings.state_backend)
+    drive = drive_client(settings) if backend == "drive" else None
+    days = max(1, int(args.days if getattr(args, "days", None) else settings.intraday_days))
+    end = health_today(settings)
+    date_strings = date_range(end - timedelta(days=days - 1), end)
+
+    api = load_garmin_client(settings, backend=backend, drive=drive)
+    raw_archives = [fetch_daily_health_archive(api, cdate) for cdate in date_strings]
+    save_garmin_token(settings, backend=backend, drive=drive)
+
+    fetched_days = [normalize_health_archive(archive) for archive in raw_archives]
+    sql_sink.sync_health(settings, fetched_days, raw_archives=raw_archives)
+
+    print(f"Intraday refresh: fetched {len(raw_archives)} day(s) up to {end.isoformat()}; "
+          f"updated health_intraday + current_status for user {settings.bodycompass_user_id}.")
+    return 0
 
 
 def sync_all_sources(settings: Settings, args: argparse.Namespace) -> int:
@@ -1008,6 +1059,12 @@ def publish_cache(settings: Settings, args: argparse.Namespace) -> int:
         save_raw_manifest(settings, raw_manifest, backend=backend, drive=drive)
 
     save_run_history(settings, merged_runs, backend=backend, drive=drive)
+
+    # Backfill the Body Compass sink from the whole local cache: summaries + the full run-detail /
+    # stream tables for every cached archive (best-effort; never blocks the Drive publish).
+    if settings.sql_sink_enabled:
+        sql_sink.sync_runs(settings, merged_runs, route_features, archives=archives)
+
     sync_state = load_sync_state(settings, backend=backend, drive=drive)
     sync_state.update(
         {

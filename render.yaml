@@ -75,3 +75,29 @@ services:
         sync: false
       - key: BODYCOMPASS_USER_ID
         value: default
+
+  - type: cron
+    name: garmin-intraday-sync
+    runtime: python
+    region: ohio
+    plan: starter
+    # Frequent, lightweight "now" refresh: fetches today's latest intraday health and updates the
+    # SQL sink only (no Drive rebuild). Garmin is only as fresh as the last watch->phone sync.
+    schedule: "*/15 * * * *"
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python -m garmin_drive sync-garmin-intraday --state-backend drive"
+    envVars:
+      - key: GARMIN_DRIVE_STATE_BACKEND
+        value: drive
+      - key: GARMIN_HEALTH_TIMEZONE
+        value: America/New_York
+      - key: PYTHON_VERSION
+        value: "3.12.9"
+      # Secrets: enter these in the Render dashboard, never commit them.
+      - key: GOOGLE_TOKEN_JSON
+        sync: false
+      # Body Compass Supabase sink (session pooler URI; see the Strava cron note above).
+      - key: DATABASE_URL
+        sync: false
+      - key: BODYCOMPASS_USER_ID
+        value: default

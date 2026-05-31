@@ -73,3 +73,66 @@ create table if not exists ingest_meta (
   last_ingested_at timestamptz default now(), row_count integer,
   primary key (user_id, source)
 );
+
+-- --- richer raw + intraday fidelity -------------------------------------------------------------
+-- All additive: the four summary tables above are unchanged, so existing SELECT * reads keep working.
+-- Summaries stay the cheap, query-friendly surface; these hold the full per-day / per-run data.
+
+-- Mark the in-progress day and when each health row was last refreshed (for the "now" view).
+alter table health add column if not exists is_partial boolean;
+alter table health add column if not exists last_synced_at timestamptz;
+
+-- Entire Garmin payloads dict per day: total fidelity, migration-proof (any future field is here).
+create table if not exists health_raw (
+  user_id text not null,
+  date date not null,
+  source text, fetched_at text,
+  payloads jsonb, metric_errors jsonb,
+  primary key (user_id, date)
+);
+
+-- Per-sample intraday time-series as [[epoch_ms, value], ...] arrays, for the dashboard charts.
+create table if not exists health_intraday (
+  user_id text not null,
+  date date not null,
+  is_partial boolean, last_synced_at timestamptz,
+  hr_series jsonb, stress_series jsonb, body_battery_series jsonb,
+  respiration_series jsonb, spo2_series jsonb, steps_series jsonb,
+  sample_counts jsonb,
+  primary key (user_id, date)
+);
+
+-- One row per user: the latest readings Garmin has ("now"), for an O(1) dashboard snapshot read.
+create table if not exists current_status (
+  user_id text not null,
+  as_of_date date,
+  latest_hr double precision, latest_hr_at timestamptz,
+  current_body_battery double precision, current_stress double precision,
+  steps double precision, resting_hr double precision,
+  sleep_score double precision, training_readiness_score double precision,
+  last_reading_at timestamptz, is_partial boolean, last_synced_at timestamptz,
+  raw jsonb,
+  primary key (user_id)
+);
+
+-- Complete run record for a Strava-like detail tab: full activity + derived splits + route in one row.
+create table if not exists run_details (
+  user_id text not null,
+  source_activity_id text not null,
+  local_date date, name text, sport_type text,
+  schema_version integer, fetched_at text,
+  activity jsonb, mile_splits jsonb, route jsonb,
+  primary key (user_id, source_activity_id)
+);
+
+-- Full per-sample run streams (HR/pace/altitude/latlng/cadence/…); powers detail-tab time charts.
+create table if not exists run_streams (
+  user_id text not null,
+  source_activity_id text not null,
+  local_date date, stream_types text[], sample_count integer,
+  streams jsonb, fetched_at text,
+  primary key (user_id, source_activity_id)
+);
+
+create index if not exists health_user_date_idx on health (user_id, date);
+create index if not exists runs_user_local_date_idx on runs (user_id, local_date);

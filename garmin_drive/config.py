@@ -64,6 +64,9 @@ class Settings:
     database_url: str | None = None   # Postgres/Supabase connection string (session pooler URI)
     bodycompass_user_id: str = "default"  # tag every synced row with this user id (app's DEFAULT_USER_ID)
     bodycompass_sql_sink: bool = True     # master switch; the sink also needs database_url to be set
+    store_run_streams: bool = True        # mirror full per-sample run streams (large); off = summaries + details only
+    intraday_enabled: bool = True         # store intraday time-series + the "now" snapshot from fetched health days
+    intraday_days: int = 1                # how many trailing days the lightweight sync-garmin-intraday refreshes
 
     @property
     def sql_sink_enabled(self) -> bool:
@@ -137,6 +140,9 @@ def get_settings() -> Settings:
         database_url=os.getenv("DATABASE_URL") or None,
         bodycompass_user_id=os.getenv("BODYCOMPASS_USER_ID", "default"),
         bodycompass_sql_sink=env_bool("BODYCOMPASS_SQL_SINK", True),
+        store_run_streams=env_bool("BODYCOMPASS_STORE_RUN_STREAMS", True),
+        intraday_enabled=env_bool("BODYCOMPASS_INTRADAY", True),
+        intraday_days=max(1, int(os.getenv("BODYCOMPASS_INTRADAY_DAYS", "1") or 1)),
     )
 
 

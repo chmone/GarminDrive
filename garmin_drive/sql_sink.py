@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import date, datetime, timezone
 from typing import Any, Iterable, Sequence
 
 from .config import Settings
@@ -138,6 +139,67 @@ create table if not exists ingest_meta (
   last_ingested_at timestamptz default now(), row_count integer,
   primary key (user_id, source)
 );
+
+-- --- richer raw + intraday fidelity (all additive; existing tables/reads are untouched) ---
+
+-- Mark the in-progress day and when each health row was last refreshed (for the "now" view).
+alter table health add column if not exists is_partial boolean;
+alter table health add column if not exists last_synced_at timestamptz;
+
+-- Entire Garmin payloads dict per day: total fidelity, migration-proof (any future field is here).
+create table if not exists health_raw (
+  user_id text not null,
+  date date not null,
+  source text, fetched_at text,
+  payloads jsonb, metric_errors jsonb,
+  primary key (user_id, date)
+);
+
+-- Per-sample intraday time-series as [[epoch_ms, value], ...] arrays, for the dashboard charts.
+create table if not exists health_intraday (
+  user_id text not null,
+  date date not null,
+  is_partial boolean, last_synced_at timestamptz,
+  hr_series jsonb, stress_series jsonb, body_battery_series jsonb,
+  respiration_series jsonb, spo2_series jsonb, steps_series jsonb,
+  sample_counts jsonb,
+  primary key (user_id, date)
+);
+
+-- One row per user: the latest readings Garmin has ("now"), for an O(1) dashboard snapshot read.
+create table if not exists current_status (
+  user_id text not null,
+  as_of_date date,
+  latest_hr double precision, latest_hr_at timestamptz,
+  current_body_battery double precision, current_stress double precision,
+  steps double precision, resting_hr double precision,
+  sleep_score double precision, training_readiness_score double precision,
+  last_reading_at timestamptz, is_partial boolean, last_synced_at timestamptz,
+  raw jsonb,
+  primary key (user_id)
+);
+
+-- Complete run record for a Strava-like detail tab: full activity + derived splits + route in one row.
+create table if not exists run_details (
+  user_id text not null,
+  source_activity_id text not null,
+  local_date date, name text, sport_type text,
+  schema_version integer, fetched_at text,
+  activity jsonb, mile_splits jsonb, route jsonb,
+  primary key (user_id, source_activity_id)
+);
+
+-- Full per-sample run streams (HR/pace/altitude/latlng/cadence/…); powers detail-tab time charts.
+create table if not exists run_streams (
+  user_id text not null,
+  source_activity_id text not null,
+  local_date date, stream_types text[], sample_count integer,
+  streams jsonb, fetched_at text,
+  primary key (user_id, source_activity_id)
+);
+
+create index if not exists health_user_date_idx on health (user_id, date);
+create index if not exists runs_user_local_date_idx on runs (user_id, local_date);
 """
 
 
@@ -213,15 +275,19 @@ def _split_params(rows: Iterable[dict], user_id: str, Jsonb) -> list[tuple]:
     return out
 
 
-def _health_params(days: Iterable[dict], user_id: str, Jsonb) -> list[tuple]:
+def _health_params(days: Iterable[dict], user_id: str, Jsonb, *, today: str = "",
+                   synced_at: str = "") -> list[tuple]:
     out = []
     for day in days:
-        if not isinstance(day, dict) or not _norm(day.get("date")):
+        d = _norm(day.get("date"))
+        if not isinstance(day, dict) or not d:
             continue
         vals = [user_id]
         for _, key in HEALTH_COLUMNS:
             v = day.get(key)
             vals.append(_as_text(v) if key in ("available_metrics", "metric_errors") else _norm(v))
+        vals.append(str(d) == today if today else None)   # is_partial
+        vals.append(synced_at or None)                     # last_synced_at
         vals.append(Jsonb(day))
         out.append(tuple(vals))
     return out
@@ -249,10 +315,107 @@ def _route_params(features: Iterable[dict], user_id: str, Jsonb) -> list[tuple]:
     return out
 
 
+def _today_iso(settings: Settings) -> str:
+    """Today in the configured health timezone, as YYYY-MM-DD — used to flag the in-progress day."""
+    try:
+        from zoneinfo import ZoneInfo  # noqa: PLC0415
+        return datetime.now(ZoneInfo(settings.garmin_health_timezone)).date().isoformat()
+    except Exception:  # noqa: BLE001 — bad/unknown tz: fall back to the host date.
+        return date.today().isoformat()
+
+
+def _archive_local_date(activity: dict, route: Any) -> str | None:
+    if isinstance(route, dict):
+        ld = (route.get("properties") or {}).get("local_date")
+        if ld:
+            return str(ld)
+    start = activity.get("start_date_local")
+    return start[:10] if isinstance(start, str) and len(start) >= 10 else None
+
+
+def _health_raw_params(archives: Iterable[dict], user_id: str, Jsonb) -> list[tuple]:
+    out = []
+    for archive in archives:
+        if not isinstance(archive, dict) or not _norm(archive.get("date")):
+            continue
+        out.append((
+            user_id, _norm(archive.get("date")), archive.get("source"), archive.get("fetched_at"),
+            Jsonb(archive.get("payloads") or {}), Jsonb(archive.get("metric_errors") or {}),
+        ))
+    return out
+
+
+def _health_intraday_params(rows: Iterable[dict], user_id: str, Jsonb, *, today: str,
+                            synced_at: str) -> list[tuple]:
+    out = []
+    for row in rows:
+        d = _norm(row.get("date"))
+        if not isinstance(row, dict) or not d:
+            continue
+        out.append((
+            user_id, d, str(d) == today, synced_at,
+            Jsonb(row.get("hr_series") or []), Jsonb(row.get("stress_series") or []),
+            Jsonb(row.get("body_battery_series") or []), Jsonb(row.get("respiration_series") or []),
+            Jsonb(row.get("spo2_series") or []), Jsonb(row.get("steps_series") or []),
+            Jsonb(row.get("sample_counts") or {}),
+        ))
+    return out
+
+
+def _current_status_params(status: dict | None, user_id: str, Jsonb) -> list[tuple]:
+    if not status:
+        return []
+    keys = ("as_of_date", "latest_hr", "latest_hr_at", "current_body_battery", "current_stress",
+            "steps", "resting_hr", "sleep_score", "training_readiness_score", "last_reading_at",
+            "is_partial", "last_synced_at")
+    return [(user_id, *(_norm(status.get(k)) for k in keys), Jsonb(status))]
+
+
+def _run_detail_params(archives: Iterable[dict], user_id: str, Jsonb) -> list[tuple]:
+    out = []
+    for archive in archives:
+        if not isinstance(archive, dict):
+            continue
+        activity = archive.get("activity") if isinstance(archive.get("activity"), dict) else {}
+        aid = str(archive.get("source_activity_id") or activity.get("id") or "")
+        if not aid:
+            continue
+        route = archive.get("route")
+        out.append((
+            user_id, aid, _norm(_archive_local_date(activity, route)),
+            activity.get("name"), activity.get("sport_type") or activity.get("type"),
+            archive.get("schema_version"), archive.get("fetched_at"),
+            Jsonb(activity), Jsonb(archive.get("mile_splits") or []),
+            Jsonb(route) if route else None,
+        ))
+    return out
+
+
+def _run_stream_params(archives: Iterable[dict], user_id: str, Jsonb) -> list[tuple]:
+    out = []
+    for archive in archives:
+        if not isinstance(archive, dict):
+            continue
+        activity = archive.get("activity") if isinstance(archive.get("activity"), dict) else {}
+        aid = str(archive.get("source_activity_id") or activity.get("id") or "")
+        streams = archive.get("streams")
+        if not aid or not isinstance(streams, dict) or not streams:
+            continue
+        stream_types = archive.get("stream_types") or sorted(streams.keys())
+        out.append((
+            user_id, aid, _norm(_archive_local_date(activity, archive.get("route"))),
+            list(stream_types), archive.get("stream_sample_count"),
+            Jsonb(streams), archive.get("fetched_at"),
+        ))
+    return out
+
+
 # --- public API --------------------------------------------------------------
 
-def sync_runs(settings: Settings, runs: list[dict], route_features: dict | None = None) -> None:
-    """Upsert runs + their mile splits (+ routes when a fresh route collection is available)."""
+def sync_runs(settings: Settings, runs: list[dict], route_features: dict | None = None,
+              archives: list[dict] | None = None) -> None:
+    """Upsert run summaries + mile splits (+ routes) and, for any raw archives provided, the full
+    per-run detail (activity + splits + route) and per-sample streams for the run-detail tab."""
     if not settings.sql_sink_enabled:
         return
     from .corpus import all_mile_split_rows  # noqa: PLC0415 — avoid a cycle at import time
@@ -260,6 +423,7 @@ def sync_runs(settings: Settings, runs: list[dict], route_features: dict | None 
     if psycopg is None:
         return
     uid = settings.bodycompass_user_id
+    archives = archives or []
     try:
         with psycopg.connect(settings.database_url) as conn:
             with conn.cursor() as cur:
@@ -278,32 +442,78 @@ def sync_runs(settings: Settings, runs: list[dict], route_features: dict | None 
                                        ["user_id"] + ROUTE_COLUMNS + ["geometry"],
                                        ["user_id", "source_activity_id"],
                                        _route_params(route_features["features"], uid, Jsonb))
+                n_details = _upsert(cur, Jsonb, "run_details",
+                                    ["user_id", "source_activity_id", "local_date", "name",
+                                     "sport_type", "schema_version", "fetched_at", "activity",
+                                     "mile_splits", "route"],
+                                    ["user_id", "source_activity_id"],
+                                    _run_detail_params(archives, uid, Jsonb))
+                n_streams = 0
+                if settings.store_run_streams:
+                    n_streams = _upsert(cur, Jsonb, "run_streams",
+                                        ["user_id", "source_activity_id", "local_date",
+                                         "stream_types", "sample_count", "streams", "fetched_at"],
+                                        ["user_id", "source_activity_id"],
+                                        _run_stream_params(archives, uid, Jsonb))
                 _write_meta(cur, uid, "strava", n_runs)
             conn.commit()
-        log.info("SQL sink: upserted %s runs, %s splits, %s routes (user=%s).",
-                 n_runs, n_splits, n_routes, uid)
+        log.info("SQL sink: upserted %s runs, %s splits, %s routes, %s details, %s streams (user=%s).",
+                 n_runs, n_splits, n_routes, n_details, n_streams, uid)
     except Exception as exc:  # noqa: BLE001 — never let the sink break the Drive publish
         log.warning("SQL sink (runs) failed; Drive output is unaffected. (%s)", exc)
 
 
-def sync_health(settings: Settings, days: list[dict]) -> None:
+def sync_health(settings: Settings, days: list[dict], raw_archives: list[dict] | None = None) -> None:
+    """Upsert daily health summaries and, for any raw archives provided (today + the fetched
+    window), the full payloads, intraday time-series, and the per-user "now" snapshot."""
     if not settings.sql_sink_enabled:
         return
     psycopg, Jsonb = _psycopg()
     if psycopg is None:
         return
     uid = settings.bodycompass_user_id
+    today = _today_iso(settings)
+    synced_at = datetime.now(timezone.utc).isoformat()
+    raw_archives = raw_archives or []
+    intraday_rows: list[dict] = []
+    status: dict | None = None
+    if settings.intraday_enabled and raw_archives:
+        from .health_corpus import build_current_status, build_health_intraday  # noqa: PLC0415
+        intraday_rows = [build_health_intraday(a) for a in raw_archives if isinstance(a, dict)]
+        latest = max((a for a in raw_archives if isinstance(a, dict) and a.get("date")),
+                     key=lambda a: str(a.get("date")), default=None)
+        if latest is not None:
+            status = build_current_status(latest, is_partial=str(latest.get("date")) == today,
+                                          last_synced_at=synced_at)
     try:
         with psycopg.connect(settings.database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(SCHEMA_SQL)
                 n = _upsert(cur, Jsonb, "health",
-                            ["user_id"] + [c for c, _ in HEALTH_COLUMNS] + ["raw"],
+                            ["user_id"] + [c for c, _ in HEALTH_COLUMNS]
+                            + ["is_partial", "last_synced_at", "raw"],
                             ["user_id", "date"],
-                            _health_params(days, uid, Jsonb))
+                            _health_params(days, uid, Jsonb, today=today, synced_at=synced_at))
+                n_raw = _upsert(cur, Jsonb, "health_raw",
+                                ["user_id", "date", "source", "fetched_at", "payloads", "metric_errors"],
+                                ["user_id", "date"], _health_raw_params(raw_archives, uid, Jsonb))
+                n_intra = _upsert(cur, Jsonb, "health_intraday",
+                                  ["user_id", "date", "is_partial", "last_synced_at", "hr_series",
+                                   "stress_series", "body_battery_series", "respiration_series",
+                                   "spo2_series", "steps_series", "sample_counts"],
+                                  ["user_id", "date"],
+                                  _health_intraday_params(intraday_rows, uid, Jsonb,
+                                                          today=today, synced_at=synced_at))
+                n_status = _upsert(cur, Jsonb, "current_status",
+                                   ["user_id", "as_of_date", "latest_hr", "latest_hr_at",
+                                    "current_body_battery", "current_stress", "steps", "resting_hr",
+                                    "sleep_score", "training_readiness_score", "last_reading_at",
+                                    "is_partial", "last_synced_at", "raw"],
+                                   ["user_id"], _current_status_params(status, uid, Jsonb))
                 _write_meta(cur, uid, "garmin_health", n)
             conn.commit()
-        log.info("SQL sink: upserted %s health days (user=%s).", n, uid)
+        log.info("SQL sink: upserted %s health days, %s raw, %s intraday, %s status (user=%s).",
+                 n, n_raw, n_intra, n_status, uid)
     except Exception as exc:  # noqa: BLE001
         log.warning("SQL sink (health) failed; Drive output is unaffected. (%s)", exc)
 
