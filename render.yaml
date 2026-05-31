@@ -39,6 +39,8 @@ services:
         sync: false
       # Body Compass Supabase sink. Use the Supabase SESSION POOLER URI (Render is IPv4-only; the
       # direct db.<ref> host is IPv6-only). Leave unset to disable the sink (Drive output unaffected).
+      # Per-run weather (Open-Meteo, key-less) populates automatically when the sink is on; set
+      # BODYCOMPASS_WEATHER=false to disable it.
       - key: DATABASE_URL
         sync: false
       - key: BODYCOMPASS_USER_ID
