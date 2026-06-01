@@ -377,6 +377,8 @@ def _health_intraday_params(rows: Iterable[dict], user_id: str, Jsonb, *, today:
         d = _norm(row.get("date"))
         if not isinstance(row, dict) or not d:
             continue
+        if not _has_intraday_samples(row):
+            continue
         out.append((
             user_id, d, str(d) == today, synced_at,
             Jsonb(row.get("hr_series") or []), Jsonb(row.get("stress_series") or []),
@@ -388,12 +390,36 @@ def _health_intraday_params(rows: Iterable[dict], user_id: str, Jsonb, *, today:
 
 
 def _current_status_params(status: dict | None, user_id: str, Jsonb) -> list[tuple]:
-    if not status:
+    if not status or not _has_current_status_reading(status):
         return []
     keys = ("as_of_date", "latest_hr", "latest_hr_at", "current_body_battery", "current_stress",
             "steps", "resting_hr", "sleep_score", "training_readiness_score", "last_reading_at",
             "is_partial", "last_synced_at")
     return [(user_id, *(_norm(status.get(k)) for k in keys), Jsonb(status))]
+
+
+def _has_intraday_samples(row: dict) -> bool:
+    counts = row.get("sample_counts")
+    if isinstance(counts, dict):
+        for value in counts.values():
+            try:
+                if int(value or 0) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    for key in ("hr_series", "stress_series", "body_battery_series",
+                "respiration_series", "spo2_series", "steps_series"):
+        series = row.get(key)
+        if isinstance(series, (list, tuple)) and len(series) > 0:
+            return True
+    return False
+
+
+def _has_current_status_reading(status: dict) -> bool:
+    return any(
+        status.get(key) is not None
+        for key in ("latest_hr", "current_body_battery", "current_stress", "steps", "last_reading_at")
+    )
 
 
 def _run_detail_params(archives: Iterable[dict], user_id: str, Jsonb) -> list[tuple]:

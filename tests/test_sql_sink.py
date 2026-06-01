@@ -143,6 +143,16 @@ def test_health_intraday_params_flags_partial_and_wraps_series():
     assert isinstance(row[4], _J) and row[4].obj == [[1, 60]]   # hr_series jsonb
 
 
+def test_health_intraday_params_skips_empty_intraday_rows():
+    rows = [
+        {"date": "2026-05-31", "hr_series": [], "sample_counts": {"hr": 0, "stress": 0}},
+        {"date": "2026-05-30", "stress_series": [[1, 20]], "sample_counts": {"stress": 1}},
+    ]
+    params = sql_sink._health_intraday_params(rows, UID, _J, today="2026-05-31", synced_at="now")
+    assert len(params) == 1
+    assert params[0][1] == "2026-05-30"
+
+
 def test_current_status_params_single_row_with_snapshot():
     status = {"as_of_date": "2026-05-31", "latest_hr": 72, "current_body_battery": 55,
               "is_partial": True, "steps": 8000}
@@ -152,3 +162,13 @@ def test_current_status_params_single_row_with_snapshot():
     assert row[0] == UID and row[1] == "2026-05-31" and row[2] == 72
     assert isinstance(row[-1], _J) and row[-1].obj["steps"] == 8000
     assert sql_sink._current_status_params(None, UID, _J) == []
+
+
+def test_current_status_params_skips_empty_snapshot():
+    empty = {"as_of_date": "2026-05-31", "latest_hr": None, "current_body_battery": None,
+             "current_stress": None, "steps": None, "last_reading_at": None}
+    assert sql_sink._current_status_params(empty, UID, _J) == []
+
+    # Zero steps is still a real reading, not "missing".
+    steps_zero = {**empty, "steps": 0}
+    assert len(sql_sink._current_status_params(steps_zero, UID, _J)) == 1
