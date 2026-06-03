@@ -193,6 +193,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     add_health_sync_args(health_backfill)
 
+    subparsers.add_parser(
+        "sync-garmin-intraday",
+        help="Deprecated no-op. Body Compass now owns intraday/current-status SQL sync.",
+    )
+
     sync_all = subparsers.add_parser("sync-all", help="Run Strava activity sync and Garmin health sync.")
     sync_all.add_argument("--days", type=int, default=14, help="How many days of Strava history to inspect.")
     sync_all.add_argument("--health-days", type=int, default=14, help="How many recent Garmin health days to fetch.")
@@ -256,6 +261,8 @@ def main(argv: list[str] | None = None) -> int:
         return sync_garmin_health(settings, args)
     if args.command == "backfill-garmin-health":
         return backfill_garmin_health(settings, args)
+    if args.command == "sync-garmin-intraday":
+        return sync_garmin_intraday_noop()
     if args.command == "sync-all":
         return sync_all_sources(settings, args)
 
@@ -599,6 +606,11 @@ def backfill_garmin_health(settings: Settings, args: argparse.Namespace) -> int:
     if not args.end_date:
         args.end_date = health_today(settings).isoformat()
     return sync_garmin_health(settings, args)
+
+
+def sync_garmin_intraday_noop() -> int:
+    print("sync-garmin-intraday moved to Body Compass garmin-sync; GarminDrive no longer writes SQL.")
+    return 0
 
 
 def sync_all_sources(settings: Settings, args: argparse.Namespace) -> int:
