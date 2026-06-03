@@ -12,8 +12,6 @@ from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 import requests
-
-from . import sql_sink
 from .config import Settings, ensure_local_dirs, get_settings
 from .corpus import (
     RETIRED_TOP_LEVEL_FILES,
@@ -59,7 +57,6 @@ from .garmin_health import (
     save_garmin_token,
 )
 from .health_corpus import (
-    RAW_HEALTH_DIR,
     RETIRED_HEALTH_TOP_LEVEL_FILES,
     health_days_from_history,
     health_history_payload,
@@ -196,30 +193,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     add_health_sync_args(health_backfill)
 
-    health_intraday = subparsers.add_parser(
-        "sync-garmin-intraday",
-        help="Lightweight refresh of today's intraday health + the 'now' snapshot into the SQL sink "
-        "(no Drive corpus rebuild). Run frequently for an up-to-date dashboard.",
-    )
-    health_intraday.add_argument(
-        "--days", type=int, default=None,
-        help="Trailing days to refresh (default: BODYCOMPASS_INTRADAY_DAYS, usually 1 = today only).",
-    )
-    health_intraday.add_argument(
-        "--state-backend", choices=["auto", "local", "drive"], default=None,
-        help="Where the Garmin token lives. Defaults to env/auto.",
-    )
-
-    backfill_sql_parser = subparsers.add_parser(
-        "backfill-sql",
-        help="One-time: mirror the full raw run + health history already in Drive into Postgres "
-             "(no Strava/Garmin re-fetch). Populates run_details/run_streams/health_raw/"
-             "health_intraday and fetches per-run weather (Open-Meteo).",
-    )
-    backfill_sql_parser.add_argument("--skip-runs", action="store_true", help="Backfill health only.")
-    backfill_sql_parser.add_argument("--skip-health", action="store_true", help="Backfill runs only.")
-    backfill_sql_parser.add_argument("--chunk", type=int, default=50, help="Archives per upsert batch.")
-
     sync_all = subparsers.add_parser("sync-all", help="Run Strava activity sync and Garmin health sync.")
     sync_all.add_argument("--days", type=int, default=14, help="How many days of Strava history to inspect.")
     sync_all.add_argument("--health-days", type=int, default=14, help="How many recent Garmin health days to fetch.")
@@ -283,10 +256,6 @@ def main(argv: list[str] | None = None) -> int:
         return sync_garmin_health(settings, args)
     if args.command == "backfill-garmin-health":
         return backfill_garmin_health(settings, args)
-    if args.command == "sync-garmin-intraday":
-        return sync_garmin_intraday(settings, args)
-    if args.command == "backfill-sql":
-        return backfill_sql(settings, args)
     if args.command == "sync-all":
         return sync_all_sources(settings, args)
 
@@ -521,17 +490,6 @@ def sync_strava(settings: Settings, args: argparse.Namespace) -> int:
     )
     save_sync_state(settings, sync_state, backend=backend, drive=drive)
 
-    # Additive Body Compass sink: mirror the merged history into Postgres (best-effort; never blocks
-    # the Drive publish). Skipped on a no-op tick. `route_features` is present only when maps were
-    # rendered (not on --skip-maps crons), so routes refresh on full/publish-cache runs.
-    if settings.sql_sink_enabled and (merged_runs != existing_runs or args.force_upload or archives):
-        sql_sink.sync_runs(
-            settings,
-            merged_runs,
-            route_features if should_render_outputs else None,
-            archives=archives,
-        )
-
     if trashed_map_count:
         print(f"Moved {trashed_map_count} legacy route-only map HTML files to trash.")
     if trashed_year_doc_count:
@@ -627,11 +585,6 @@ def sync_garmin_health(settings: Settings, args: argparse.Namespace) -> int:
     )
     save_health_sync_state(settings, sync_state, backend=backend, drive=drive)
 
-    # Additive Body Compass sink (best-effort; never blocks the Drive publish). The freshly-fetched
-    # raw_archives carry the full payloads + intraday series + the "now" snapshot for today.
-    if settings.sql_sink_enabled and (fetched_days or merged_days != existing_days or args.force_upload):
-        sql_sink.sync_health(settings, merged_days, raw_archives=raw_archives)
-
     print(f"Fetched Garmin health data for {len(raw_archives)} days; skipped {len(skipped_dates)} archived days.")
     if not args.no_upload:
         print(f"Uploaded or updated {uploaded_count} health Drive files.")
@@ -646,35 +599,6 @@ def backfill_garmin_health(settings: Settings, args: argparse.Namespace) -> int:
     if not args.end_date:
         args.end_date = health_today(settings).isoformat()
     return sync_garmin_health(settings, args)
-
-
-def sync_garmin_intraday(settings: Settings, args: argparse.Namespace) -> int:
-    """Refresh the most up-to-date health Garmin has for today (and a small trailing window) and
-    mirror it into the SQL sink only — intraday series + the per-user "now" snapshot. Deliberately
-    skips the Drive corpus rebuild so it's cheap enough to run on a frequent cron."""
-    if not settings.intraday_enabled:
-        print("Intraday sync is disabled (BODYCOMPASS_INTRADAY=0); nothing to do.")
-        return 0
-    if not settings.sql_sink_enabled:
-        print("SQL sink is disabled (set DATABASE_URL); intraday data has nowhere to go. Skipping.")
-        return 0
-
-    backend = resolve_state_backend(args.state_backend or settings.state_backend)
-    drive = drive_client(settings) if backend == "drive" else None
-    days = max(1, int(args.days if getattr(args, "days", None) else settings.intraday_days))
-    end = health_today(settings)
-    date_strings = date_range(end - timedelta(days=days - 1), end)
-
-    api = load_garmin_client(settings, backend=backend, drive=drive)
-    raw_archives = [fetch_daily_health_archive(api, cdate) for cdate in date_strings]
-    save_garmin_token(settings, backend=backend, drive=drive)
-
-    fetched_days = [normalize_health_archive(archive) for archive in raw_archives]
-    sql_sink.sync_health(settings, fetched_days, raw_archives=raw_archives)
-
-    print(f"Intraday refresh: fetched {len(raw_archives)} day(s) up to {end.isoformat()}; "
-          f"updated health_intraday + current_status for user {settings.bodycompass_user_id}.")
-    return 0
 
 
 def sync_all_sources(settings: Settings, args: argparse.Namespace) -> int:
@@ -1073,11 +997,6 @@ def publish_cache(settings: Settings, args: argparse.Namespace) -> int:
 
     save_run_history(settings, merged_runs, backend=backend, drive=drive)
 
-    # Backfill the Body Compass sink from the whole local cache: summaries + the full run-detail /
-    # stream tables for every cached archive (best-effort; never blocks the Drive publish).
-    if settings.sql_sink_enabled:
-        sql_sink.sync_runs(settings, merged_runs, route_features, archives=archives)
-
     sync_state = load_sync_state(settings, backend=backend, drive=drive)
     sync_state.update(
         {
@@ -1146,96 +1065,6 @@ def load_cached_archives(settings: Settings) -> list[dict[str, Any]]:
         if isinstance(archive, dict) and isinstance(archive.get("activity"), dict):
             archives.append(archive)
     return archives
-
-
-def download_raw_archives_from_drive(
-    drive: DriveClient,
-    root_folder_id: str,
-    folder_parts: tuple[str, ...],
-) -> list[dict[str, Any]]:
-    """Download every *.json raw archive under a {parts}/{year}/ folder tree in Drive."""
-    parent = drive.find_folder_path(root_folder_id, folder_parts)
-    if not parent:
-        return []
-    archives: list[dict[str, Any]] = []
-    for year in drive.list_files_in_folder(parent["id"]):
-        if year.get("mimeType") != "application/vnd.google-apps.folder":
-            continue
-        for item in drive.list_files_in_folder(year["id"]):
-            name = str(item.get("name") or "")
-            file_id = str(item.get("id") or "")
-            if not name.endswith(".json") or not file_id:
-                continue
-            try:
-                parsed = json.loads(drive.get_text_by_id(file_id))
-            except json.JSONDecodeError:
-                print(f"Skipped invalid Drive archive: {name}")
-                continue
-            if isinstance(parsed, dict):
-                archives.append(parsed)
-    return archives
-
-
-def chunked(items: list[Any], size: int) -> list[list[Any]]:
-    size = max(1, size)
-    return [items[i:i + size] for i in range(0, len(items), size)]
-
-
-def backfill_sql(settings: Settings, args: argparse.Namespace) -> int:
-    """Mirror the full raw history already living in Drive into Postgres — one-time, no re-fetch."""
-    if not settings.sql_sink_enabled:
-        raise RuntimeError(
-            "SQL sink is disabled. Set DATABASE_URL (and keep BODYCOMPASS_SQL_SINK=1) in your .env."
-        )
-    drive = drive_client(settings)
-
-    if not args.skip_runs:
-        runs = runs_from_history(load_run_history(settings, backend="drive", drive=drive))
-        run_folder = get_run_drive_folder(settings, drive)
-        route_features = load_geojson_text(
-            drive.get_text_file_by_path(run_folder["id"], (RAW_DATA_DIR,), ALL_ROUTES_NAME)
-        )
-        run_archives = download_raw_archives_from_drive(
-            drive, run_folder["id"], (RAW_DATA_DIR, RAW_RUNS_DIR)
-        )
-        route_count = len((route_features or {}).get("features", []) or [])
-        print(
-            f"Runs: {len(runs)} summaries, {len(run_archives)} raw archives (full activity+streams), "
-            f"{route_count} routes."
-        )
-        batches = chunked(run_archives, args.chunk) or [[]]
-        for index, batch in enumerate(batches):
-            sql_sink.sync_runs(
-                settings,
-                runs if index == 0 else [],
-                route_features if index == 0 else None,
-                archives=batch,
-            )
-        print("  -> runs / splits / routes / run_details / run_streams / weather upserted.")
-
-    if not args.skip_health:
-        days = health_days_from_history(load_health_history(settings, backend="drive", drive=drive))
-        health_folder = get_health_drive_folder(settings, drive)
-        health_archives = download_raw_archives_from_drive(
-            drive, health_folder["id"], (RAW_HEALTH_DIR,)
-        )
-        # Sort ascending so the newest day lands last → current_status ends on the latest reading.
-        health_archives.sort(key=lambda archive: str(archive.get("date") or ""))
-        print(f"Health: {len(days)} day summaries, {len(health_archives)} raw archives (full payloads).")
-        batches = chunked(health_archives, max(1, args.chunk * 2)) or [[]]
-        for index, batch in enumerate(batches):
-            sql_sink.sync_health(settings, days if index == 0 else [], raw_archives=batch)
-        print("  -> health / health_raw / health_intraday / current_status upserted.")
-
-    print("\nBackfill complete. Row counts in Postgres for "
-          f"user '{settings.bodycompass_user_id}':")
-    counts = sql_sink.table_counts(settings)
-    if counts:
-        for table in sql_sink.SINK_TABLES:
-            print(f"  {table:<16} {counts.get(table, 0)}")
-    else:
-        print("  (could not read counts — check DATABASE_URL / connectivity)")
-    return 0
 
 
 def remove_legacy_id_only_local_raw_files(output_dir: Path) -> int:

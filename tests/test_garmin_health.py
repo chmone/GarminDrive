@@ -20,8 +20,6 @@ from garmin_drive.__main__ import (
 from garmin_drive.config import Settings
 from garmin_drive.garmin_health import fetch_daily_health_archive
 from garmin_drive.health_corpus import (
-    build_current_status,
-    build_health_intraday,
     health_raw_manifest_key,
     merge_health_history,
     normalize_health_archive,
@@ -192,44 +190,6 @@ class GarminHealthTests(unittest.TestCase):
         self.assertEqual(normalized["sleep_score"], 88)
         self.assertEqual(normalized["hrv_avg"], 57)
         self.assertEqual(normalized["spo2_avg"], 96)
-
-    def test_build_health_intraday_preserves_timestamped_series(self) -> None:
-        archive = {
-            "date": "2026-05-31",
-            "payloads": {
-                "heart_rates": {"heartRateValues": [[1700000000000, 60], [1700000060000, 64]]},
-                "all_day_stress": {"stressValuesArray": [[1700000000000, 20], [1700000060000, 35]]},
-                "body_battery": {"bodyBatteryValuesArray": [[1700000000000, 80], [1700000060000, 78]]},
-            },
-        }
-        intraday = build_health_intraday(archive)
-        self.assertEqual(intraday["date"], "2026-05-31")
-        self.assertEqual(intraday["hr_series"], [[1700000000000, 60], [1700000060000, 64]])
-        self.assertEqual(intraday["sample_counts"]["hr"], 2)
-        self.assertEqual(intraday["sample_counts"]["body_battery"], 2)
-        # Negative/garbage samples (Garmin uses -1 / -2 for "no reading") are dropped.
-        gappy = build_health_intraday(
-            {"date": "d", "payloads": {"heart_rates": {"heartRateValues": [[1, -1], [2, 70]]}}}
-        )
-        self.assertEqual(gappy["hr_series"], [[2, 70]])
-
-    def test_build_current_status_takes_latest_readings(self) -> None:
-        archive = {
-            "date": "2026-05-31",
-            "payloads": {
-                "stats": {"restingHeartRate": 45, "totalSteps": 8200},
-                "heart_rates": {"heartRateValues": [[1700000000000, 60], [1700000060000, 72]]},
-                "body_battery": {"bodyBatteryValuesArray": [[1700000000000, 80], [1700000060000, 55]]},
-            },
-        }
-        status = build_current_status(archive, is_partial=True, last_synced_at="2026-05-31T18:00:00+00:00")
-        self.assertEqual(status["latest_hr"], 72)            # last HR sample, not the average
-        self.assertEqual(status["current_body_battery"], 55)  # last body-battery sample
-        self.assertEqual(status["steps"], 8200)
-        self.assertEqual(status["resting_hr"], 45)
-        self.assertTrue(status["is_partial"])
-        self.assertEqual(status["last_synced_at"], "2026-05-31T18:00:00+00:00")
-        self.assertTrue(status["latest_hr_at"].startswith("2023-11-14"))  # epoch_ms -> ISO
 
     def test_bootstrap_garmin_appdata_uploads_token_and_initializes_state(self) -> None:
         drive = FakeDrive()
